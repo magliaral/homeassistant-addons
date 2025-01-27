@@ -1,0 +1,11 @@
+name: "Selenium"
+description: "Selenium Grid in Standalone mode with Chrome"
+version: "1.0.0"
+slug: "selenium"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
