@@ -2,6 +2,7 @@ name: Selenium
 version: "1.0"
 slug: selenium
 description: "Ein Selenium Docker-Container als Home Assistant Add-on"
+init: false
 arch:
   - aarch64
   - armhf
