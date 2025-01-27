@@ -6,14 +6,4 @@ arch:
   - aarch64
   - armhf
   - amd64
-startup: "services"
-boot: "auto"
-options: {}
-schema: {}
-ports:
-  - 4444/tcp
-environment:
-  # Hier können Sie Umgebungsvariablen hinzufügen, falls erforderlich
-network: host
-privileged: true
-auto_update: true
+
