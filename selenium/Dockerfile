@@ -1,4 +1,4 @@
-FROM selenium/standalone-chrome:latest
+FROM seleniarm/standalone-chromium:latest
 
 # Optional: Installieren zusätzlicher Pakete oder Anpassungen
 # RUN apt-get update && apt-get install -y <paketname>
