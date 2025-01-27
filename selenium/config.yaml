@@ -4,4 +4,8 @@ version: "1.0.0"
 slug: "selenium"
 init: false
 arch:
-  - arm64
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
