@@ -133,8 +133,10 @@ class Mapping:
 
 # ---------------- bacpypes (lazy import) ----------------
 def import_bacpypes():
+    f
     from importlib import import_module
     _Application = import_module("bacpypes3.app").Application
+    _DeviceInfoCache = import_module("bacpypes3.app").DeviceInfoCache
     _DeviceObject = import_module("bacpypes3.local.device").DeviceObject
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
@@ -202,7 +204,7 @@ class Server:
         Application, DeviceObject, AnalogValueObject, BinaryValueObject, Unsigned, Address, IAmRequest = self.bp
 
         class _HAApp(Application):  # type: ignore
-            def __init__(_self, device, addr, dev_id):
+            def __init__(_self, device, addr, dev_id, device_info_cache: Optional[_DeviceInfoCache] = None):
                 super().__init__(device, addr)
                 _self._dev_id = dev_id
 
