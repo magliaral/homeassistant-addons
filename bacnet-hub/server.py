@@ -183,7 +183,7 @@ class Server:
         self.cfg = {
             "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
-            "address": dev.get("address","0.0.0.0"),
+            "address": dev.get("address","192.168.31.36"),
             "port": int(dev.get("port", 47808)),
             "bbmd_ip": dev.get("bbmd_ip"),
             "bbmd_ttl": int(dev.get("bbmd_ttl", 600)) if dev.get("bbmd_ttl") else None,
