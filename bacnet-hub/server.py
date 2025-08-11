@@ -133,7 +133,6 @@ class Mapping:
 
 # ---------------- bacpypes (lazy import) ----------------
 def import_bacpypes():
-    f
     from importlib import import_module
     _Application = import_module("bacpypes3.app").Application
     _DeviceInfoCache = import_module("bacpypes3.app").DeviceInfoCache
