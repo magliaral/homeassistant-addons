@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -e
 
-# Mehrere mögliche Token-Namen akzeptieren
-TOKEN="${SUPERVISOR_TOKEN:-${HOME_ASSISTANT_TOKEN:-${HOMEASSISTANT_TOKEN:-${HASSIO_TOKEN:-}}}}"
+# Akzeptiere mehrere mögliche Token-Namen
+export HA_SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-${HOME_ASSISTANT_TOKEN:-${HOMEASSISTANT_TOKEN:-}}}}"
 
-if [ -z "$TOKEN" ]; then
-  echo "WARNING: No supervisor/homeassistant token found in environment."
-  echo "Make sure 'hassio_api: true' OR 'homeassistant_api: true' is set in config.yaml."
-  # wir starten trotzdem – server.py prüft erneut und loggt sauber
+# Debug-Ausgabe, um zu sehen, ob ein Token gesetzt ist (kannst du später entfernen)
+echo "ENV TOKENS (masked):"
+if [ -n "$HA_SUPERVISOR_TOKEN" ]; then
+  echo "  HA_SUPERVISOR_TOKEN = *****"
+else
+  echo "  (kein Token gefunden)"
+  echo "  Hinweis: Prüfe in config.yaml: hassio_api: true oder homeassistant_api: true"
 fi
-
-echo "ENV TOKENS:" 
-env | grep -E 'SUPERVISOR|HASSIO|HOME_ASSISTANT|HOMEASSISTANT' || true
 
 exec /venv/bin/python /usr/src/app/server.py
