@@ -6,14 +6,3 @@ arch:
   - amd64
   - aarch64
 startup: services
-boot: auto
-image: null
-init: false
-hassio_api: true
-host_network: true
-options: {}
-schema: {}
-map:
-  - config:rw
-ports:
-  47808/udp: 47808
