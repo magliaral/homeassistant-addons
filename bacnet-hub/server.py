@@ -43,19 +43,17 @@ class HAWS:
 
     async def connect(self):
         import websockets
-        # Verbinden
-        ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20,
-                                      extra_headers={"Authorization": f"Bearer {self.token}"})
-        self.ws = ws
-
-        # Auth-Handshake (bei /api/websocket notwendig; der Supervisor-Proxy reicht Header oft durch)
-        first = json.loads(await ws.recv())
+        # 1) verbinden – ohne extra_headers
+        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
+    
+        # 2) Auth-Handshake nach HA-Protokoll
+        first = json.loads(await self.ws.recv())
         if first.get("type") == "auth_required":
-            await ws.send(json.dumps({"type": "auth", "access_token": self.token}))
-            ok = json.loads(await ws.recv())
+            await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+            ok = json.loads(await self.ws.recv())
             if ok.get("type") != "auth_ok":
                 raise RuntimeError(f"WS auth failed: {ok}")
-        # Wenn kein auth_required kam, ist der Proxy bereits durch-authentifiziert
+        # Supervisor-Proxy kann evtl. schon durch-authentifiziert sein
         LOG.info("HA WebSocket connected")
 
     async def call(self, payload: Dict[str, Any]) -> Any:
