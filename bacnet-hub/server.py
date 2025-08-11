@@ -203,10 +203,26 @@ class Server:
         Application, DeviceObject, AnalogValueObject, BinaryValueObject, Unsigned, Address, IAmRequest = self.bp
 
         class _HAApp(Application):  # type: ignore
-            def __init__(_self, device, addr, dev_id, device_info_cache: Optional[_DeviceInfoCache] = None):
+            def __init__(_self, device, addr, dev_id):
                 super().__init__(device, addr)
                 _self._dev_id = dev_id
 
+            async def do_WhoIsRequest(_self, apdu):
+                low = getattr(apdu, "deviceInstanceRangeLowLimit", None)
+                high = getattr(apdu, "deviceInstanceRangeHighLimit", None)
+                if (low is not None and _self._dev_id < low) or (high is not None and _self._dev_id > high):
+                    return
+                iam = IAmRequest(
+                    iAmDeviceIdentifier=("device", _self._dev_id),
+                    maxAPDULengthAccepted=1024,
+                    segmentationSupported="noSegmentation",
+                    vendorID=999,
+                )
+                try:
+                    iam.pduDestination = apdu.pduSource
+                except Exception:
+                    iam.pduDestination = Address("255.255.255.255")
+                await _self.response(iam)
 
         self.device = DeviceObject(
             objectIdentifier=("device", self.cfg["device_id"]),
