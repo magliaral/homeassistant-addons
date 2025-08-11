@@ -15,19 +15,16 @@ async def maybe_await(x):
 # ---------------- Home Assistant WebSocket ----------------
 class HAWS:
     def __init__(self, url="ws://supervisor/core/websocket"):
-        # akzeptiere mehrere mögliche Variablen
+        self.url = os.getenv("HA_WS_URL", url)
         self.token = (
-            os.getenv("SUPERVISOR_TOKEN")
+            os.getenv("HA_SUPERVISOR_TOKEN")
+            or os.getenv("SUPERVISOR_TOKEN")
+            or os.getenv("HASSIO_TOKEN")
             or os.getenv("HOME_ASSISTANT_TOKEN")
             or os.getenv("HOMEASSISTANT_TOKEN")
-            or os.getenv("HASSIO_TOKEN")
         )
-        self.url = url
-        self.ws = None
-        self._id = 1
-        self.state_cache = {}
         if not self.token:
-            raise RuntimeError("No token in env (SUPERVISOR_TOKEN/HOME_ASSISTANT_TOKEN/…) – check add-on config.")
+            raise RuntimeError("No token in env. Set hassio_api/homeassistant_api in add-on config.")
 
     async def connect(self):
         import websockets
