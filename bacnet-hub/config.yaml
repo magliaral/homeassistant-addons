@@ -1,0 +1,19 @@
+name: BACnet Hub
+version: "0.1.0"
+slug: bacnet-hub
+description: Publiziert Home Assistant Entitäten als BACnet/IP-Objekte (WebSocket only)
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+image: null
+init: false
+hassio_api: true
+host_network: true
+options: {}
+schema: {}
+map:
+  - config:rw
+ports:
+  47808/udp: 47808
