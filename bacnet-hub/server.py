@@ -13,30 +13,50 @@ async def maybe_await(x):
     return x
 
 # ---------------- Home Assistant WebSocket ----------------
+def load_addon_options():
+    # Standard-Pfad, den der Supervisor ins Add-on mountet
+    try:
+        with open("/data/options.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 class HAWS:
-    def __init__(self, url="ws://supervisor/core/websocket"):
-        import os
-        self.url = os.getenv("HA_WS_URL", url)
+    def __init__(self):
+        opts = load_addon_options()
+        # 1) URL: Supervisor-Proxy (default) oder manuell
+        self.url = os.getenv("HA_WS_URL", opts.get("ha_url") or "ws://supervisor/core/websocket")
+
+        # 2) Token: erst Env (Supervisor), sonst Option (LLAT)
         self.token = (
             os.getenv("SUPERVISOR_TOKEN")
             or os.getenv("HASSIO_TOKEN")
             or os.getenv("HOME_ASSISTANT_TOKEN")
             or os.getenv("HOMEASSISTANT_TOKEN")
+            or (opts.get("long_lived_token") or "").strip() or None
         )
         if not self.token:
-            raise RuntimeError("No token in env. Ensure hassio_api/homeassistant_api are true in add-on config.")
+            raise RuntimeError(
+                "No token found in env or options. "
+                "Set hassio_api/homeassistant_api: true (env) or provide 'long_lived_token' in Add-on options."
+            )
 
     async def connect(self):
         import websockets
-        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
-        msg = json.loads(await self.ws.recv())
-        if msg.get("type") != "auth_required":
-            raise RuntimeError("WS expected auth_required")
-        await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
-        msg = json.loads(await self.ws.recv())
-        if msg.get("type") != "auth_ok":
-            raise RuntimeError("WS auth failed")
-        LOG.info("HA WebSocket authenticated")
+        # Verbinden
+        ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20,
+                                      extra_headers={"Authorization": f"Bearer {self.token}"})
+        self.ws = ws
+
+        # Auth-Handshake (bei /api/websocket notwendig; der Supervisor-Proxy reicht Header oft durch)
+        first = json.loads(await ws.recv())
+        if first.get("type") == "auth_required":
+            await ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+            ok = json.loads(await ws.recv())
+            if ok.get("type") != "auth_ok":
+                raise RuntimeError(f"WS auth failed: {ok}")
+        # Wenn kein auth_required kam, ist der Proxy bereits durch-authentifiziert
+        LOG.info("HA WebSocket connected")
 
     async def call(self, payload: Dict[str, Any]) -> Any:
         payload = dict(payload)
