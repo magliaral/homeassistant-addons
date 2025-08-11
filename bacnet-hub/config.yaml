@@ -13,5 +13,9 @@ homeassistant_api: true
 init: false
 map:
   - config:rw
-options: {}
-schema: {}
+options:
+  ha_url: "ws://supervisor/core/websocket"   # Standard: Supervisor-Proxy
+  long_lived_token: ""                       # Fallback (leer lassen, wenn Supervisor-Token klappt)
+schema:
+  ha_url: str
+  long_lived_token: str
