@@ -6,4 +6,4 @@ if [ -z "${SUPERVISOR_TOKEN}" ]; then
   exit 1
 fi
 
-exec python3 /usr/src/app/server.py
+exec /venv/bin/python /usr/src/app/server.py
