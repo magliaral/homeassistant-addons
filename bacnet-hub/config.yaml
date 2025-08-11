@@ -9,6 +9,8 @@ startup: services
 boot: auto
 init: false
 hassio_api: true
+homeassistant_api: true
+hassio_role: default
 host_network: true
 options: {}
 schema: {}
