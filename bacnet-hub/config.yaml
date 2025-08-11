@@ -6,3 +6,5 @@ arch:
   - amd64
   - aarch64
 startup: services
+boot: auto
+
