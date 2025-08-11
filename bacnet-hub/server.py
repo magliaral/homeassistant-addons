@@ -132,7 +132,7 @@ ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
 SUPPORTED_TYPES = {"analogValue","binaryValue"}
 
 class Server:
-    def __init__(self, cfg_path="/config/bacnet_hub/mappings.yaml"):
+    def __init__(self, cfg_path="/config/bacnet-hub/mappings.yaml"):
         self.cfg_path = cfg_path
         self.cfg = {}
         self.mappings: List[Mapping] = []
