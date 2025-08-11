@@ -10,4 +10,7 @@ if [ -z "$TOKEN" ]; then
   # wir starten trotzdem – server.py prüft erneut und loggt sauber
 fi
 
+echo "ENV TOKENS:" 
+env | grep -E 'SUPERVISOR|HASSIO|HOME_ASSISTANT|HOMEASSISTANT' || true
+
 exec /venv/bin/python /usr/src/app/server.py
