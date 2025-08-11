@@ -16,5 +16,3 @@ options: {}
 schema: {}
 map:
   - config:rw
-ports:
-  47808/udp: 47808
