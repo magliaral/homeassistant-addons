@@ -146,7 +146,7 @@ class Server:
         if not os.path.exists(self.cfg_path):
             raise FileNotFoundError(f"Config not found: {self.cfg_path}")
         with open(self.cfg_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) || {}
+            raw = yaml.safe_load(f) or {}
         dev = raw.get("device", {}) or {}
         objs = raw.get("objects", []) or []
         self.cfg = {
