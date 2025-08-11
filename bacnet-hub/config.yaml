@@ -7,4 +7,5 @@ arch:
   - aarch64
 startup: services
 boot: auto
+image: null
 
