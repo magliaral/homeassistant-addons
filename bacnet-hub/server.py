@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, json, logging, os, yaml, inspect
+import websockets 
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, List, Optional
 
