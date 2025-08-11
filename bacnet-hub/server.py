@@ -216,6 +216,7 @@ class Server:
         bind = f'{self.cfg["address"]}:{self.cfg["port"]}'
         self.app = _HAApp(self.device, Address(bind), self.cfg["device_id"])
         LOG.info("BACnet bound to %s device-id=%s", bind, self.cfg["device_id"])
+        LOG.info("BACnet bound %s", self.app)
 
         if self.cfg.get("bbmd_ip"):
             reg = getattr(self.app, "register_bbmd", None)
