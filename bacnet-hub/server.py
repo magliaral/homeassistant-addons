@@ -14,7 +14,6 @@ async def maybe_await(x):
 
 # ---------------- Home Assistant WebSocket ----------------
 def load_addon_options():
-    # Standard-Pfad, den der Supervisor ins Add-on mountet
     try:
         with open("/data/options.json", "r", encoding="utf-8") as f:
             return json.load(f)
@@ -24,10 +23,10 @@ def load_addon_options():
 class HAWS:
     def __init__(self):
         opts = load_addon_options()
-        # 1) URL: Supervisor-Proxy (default) oder manuell
+        # URL: Supervisor-Proxy default, sonst aus Optionen/ENV
         self.url = os.getenv("HA_WS_URL", opts.get("ha_url") or "ws://supervisor/core/websocket")
 
-        # 2) Token: erst Env (Supervisor), sonst Option (LLAT)
+        # Token: Env (Supervisor) -> Optionen (LLAT)
         self.token = (
             os.getenv("SUPERVISOR_TOKEN")
             or os.getenv("HASSIO_TOKEN")
@@ -38,28 +37,36 @@ class HAWS:
         if not self.token:
             raise RuntimeError(
                 "No token found in env or options. "
-                "Set hassio_api/homeassistant_api: true (env) or provide 'long_lived_token' in Add-on options."
+                "Enable hassio_api/homeassistant_api in add-on config OR set 'long_lived_token'."
             )
 
+        # *** WICHTIG: Initialwerte setzen ***
+        self.ws = None
+        self._id = 1
+        self.state_cache = {}
+
     async def connect(self):
-        import websockets
-        # 1) verbinden – ohne extra_headers
+        # ohne extra_headers (macht bei manchen websockets-Versionen Ärger)
         self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
-    
-        # 2) Auth-Handshake nach HA-Protokoll
+
+        # Auth-Handshake (HA WebSocket API)
         first = json.loads(await self.ws.recv())
         if first.get("type") == "auth_required":
             await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
             ok = json.loads(await self.ws.recv())
             if ok.get("type") != "auth_ok":
                 raise RuntimeError(f"WS auth failed: {ok}")
-        # Supervisor-Proxy kann evtl. schon durch-authentifiziert sein
+        # Supervisor-Proxy kann schon durch-authentifiziert sein
         LOG.info("HA WebSocket connected")
 
-    async def call(self, payload: Dict[str, Any]) -> Any:
+    async def call(self, payload: dict) -> dict:
+        if not self.ws:
+            raise RuntimeError("WS not connected")
         payload = dict(payload)
-        payload.setdefault("id", self._id); self._id += 1
+        payload.setdefault("id", self._id)
+        self._id += 1
         await self.ws.send(json.dumps(payload))
+        # einfache request/response-Schleife
         while True:
             msg = json.loads(await self.ws.recv())
             if msg.get("id") == payload["id"]:
@@ -67,24 +74,29 @@ class HAWS:
 
     async def prime_states(self):
         res = await self.call({"type": "get_states"})
-        states = res.get("result", res.get("data", []))
+        states = res.get("result", res.get("data", [])) or []
         for s in states:
             self.state_cache[s["entity_id"]] = s
 
     async def subscribe_state_changes(self, on_event):
-        sub_id = self._id; self._id += 1
+        # Event-Subscription
+        sub_id = self._id
+        self._id += 1
         await self.ws.send(json.dumps({"id": sub_id, "type": "subscribe_events", "event_type": "state_changed"}))
+
         async def _loop():
             while True:
-                evt = json.loads(await self.ws.recv())
+                raw = await self.ws.recv()
+                evt = json.loads(raw)
                 if evt.get("type") == "event" and evt.get("event", {}).get("event_type") == "state_changed":
                     data = evt["event"]["data"]
                     ent_id = data["entity_id"]
                     self.state_cache[ent_id] = data.get("new_state") or {}
                     await on_event(data)
+
         asyncio.create_task(_loop())
 
-    def get_value(self, entity_id: str, mode="state", attr: Optional[str]=None, analog=False):
+    def get_value(self, entity_id: str, mode="state", attr: str | None = None, analog=False):
         st = self.state_cache.get(entity_id)
         if not st:
             return None
@@ -94,9 +106,9 @@ class HAWS:
                 return float(val)
             except Exception:
                 return 0.0
-        return str(val).lower() in ("on","true","1","open","heat","cool")
+        return str(val).lower() in ("on", "true", "1", "open", "heat", "cool")
 
-    async def call_service(self, domain: str, service: str, data: Dict[str, Any]):
+    async def call_service(self, domain: str, service: str, data: dict):
         res = await self.call({"type": "call_service", "domain": domain, "service": service, "service_data": data})
         if not res.get("success", True):
             LOG.warning("Service call failed: %s", res)
