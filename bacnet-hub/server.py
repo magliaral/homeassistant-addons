@@ -119,7 +119,7 @@ def _pid_is_present_value(prop) -> bool:
 # -----------------------------------------------------------
 # YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CFG_DIR = "/config/bacnet_hub"
+DEFAULT_CFG_DIR = "/config/bacnet-hub"
 DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
 DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
 
