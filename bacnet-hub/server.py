@@ -34,7 +34,6 @@ OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
-LOG_APDU = bool(OPTS.get("log_apdu", False))
 
 # -----------------------------------------------------------
 # bacpypes3 Debugging (ModuleLogger + Decorator)
@@ -306,19 +305,14 @@ def import_bacpypes():
     except Exception:
         BinaryPV = None
 
-    # APDU Klassen für Logging
-    _apdu = import_module("bacpypes3.apdu")
-    WritePropertyRequest = getattr(_apdu, "WritePropertyRequest", None)
-    WritePropertyMultipleRequest = getattr(_apdu, "WritePropertyMultipleRequest", None)
-
-    return (_Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject,
-            AV, BV, _Unsigned, _Address, BinaryPV, WritePropertyRequest, WritePropertyMultipleRequest)
+    return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address, BinaryPV
 
 # -----------------------------------------------------------
-# Custom Local Objects (Overrides)
+# Custom Local Objects (saubere Overrides)
 # -----------------------------------------------------------
 class CustomAnalogValueObject:
     def __init__(self, base_cls, mapping: Mapping, server: "Server"):
+        # dynamisch eine Subklasse erzeugen, die Read/Write überschreibt
         class _AV(base_cls):  # type: ignore[misc]
             async def ReadProperty(self, prop, arrayIndex=None):  # type: ignore[override]
                 if _pid_is_present_value(prop) and server.ha:
@@ -390,35 +384,6 @@ class CustomBinaryValueObject:
                     await server._write_to_ha(mapping, on)
                 return await super().WriteProperty(prop, value, arrayIndex, priority, direct)  # type: ignore[misc]
         self.cls = _BV
-
-# -----------------------------------------------------------
-# Custom Application mit APDU-Logging (WriteProperty)
-# -----------------------------------------------------------
-def make_custom_application(base_cls, WritePropertyRequest, WritePropertyMultipleRequest):
-    @bacpypes_debugging
-    class CustomApplication(base_cls):  # type: ignore[misc]
-        async def do_WritePropertyRequest(self, apdu):  # type: ignore[override]
-            try:
-                obj = getattr(apdu, "objectIdentifier", None)
-                prop = getattr(apdu, "propertyIdentifier", None)
-                value = getattr(apdu, "propertyValue", None)
-                prio = getattr(apdu, "priority", None)
-                LOG.info("APDU WritePropertyRequest obj=%r prop=%r prio=%r value=%r", obj, prop, prio, value)
-                if LOG_APDU and hasattr(apdu, "debug_contents"):
-                    apdu.debug_contents()
-            except Exception:
-                LOG.info("APDU WritePropertyRequest (unable to format)")
-            return await super().do_WritePropertyRequest(apdu)  # type: ignore[misc]
-
-        async def do_WritePropertyMultipleRequest(self, apdu):  # type: ignore[override]
-            try:
-                LOG.info("APDU WritePropertyMultipleRequest recv")
-                if LOG_APDU and hasattr(apdu, "debug_contents"):
-                    apdu.debug_contents()
-            except Exception:
-                LOG.info("APDU WritePropertyMultipleRequest (unable to format)")
-            return await super().do_WritePropertyMultipleRequest(apdu)  # type: ignore[misc]
-    return CustomApplication
 
 # -----------------------------------------------------------
 # Server
@@ -556,16 +521,11 @@ class Server:
         await self.ha.prime_states()
 
         # 3) BACpypes importieren & Parser/Args vorbereiten
-        (BaseApplication, SimpleArgumentParser, YAMLArgumentParser, DeviceObject,
-         AV, BV, Unsigned, Address, BinaryPV, WPR, WPMR) = import_bacpypes()
-
-        # 4) Custom Application-Klasse mit Write-APDU-Logging
-        CustomApplication = make_custom_application(BaseApplication, WPR, WPMR)
-
+        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address, BinaryPV = import_bacpypes()
         args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
-        # 5) Application starten
-        app = CustomApplication.from_args(args)   # <— unsere Subklasse!
+        # 4) Application starten
+        app = Application.from_args(args)
         self.app = app
 
         # Device referenzieren
@@ -594,16 +554,16 @@ class Server:
             LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
         LOG.debug("app: %r", self.app)
 
-        # 6) Objekte anlegen
+        # 5) Objekte anlegen
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
             await self._add_object(self.app, m, AV, BV, BinaryPV)
 
-        # 7) Initiale Synchronisierung
+        # 6) Initiale Synchronisierung
         await self._initial_sync()
 
-        # 8) Live-Events abonnieren
+        # 7) Live-Events abonnieren
         await self.ha.subscribe_state_changes(self._on_state_changed)
 
     async def _on_state_changed(self, data: Dict[str, Any]):
