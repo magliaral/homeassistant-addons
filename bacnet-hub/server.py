@@ -96,7 +96,7 @@ def dump_obj_debug(prefix: str, obj) -> None:
 # -----------------------------------------------------------
 # YAML laden und argv für BACpypes bauen (wie in deinem Beispiel)
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
+DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
