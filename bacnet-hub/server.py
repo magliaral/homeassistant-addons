@@ -529,7 +529,7 @@ class Server:
             except Exception:
                 LOG.debug("args: %r", vars(args))
 
-        bind_addr = getattr(args, "address", None) or "0.0.0.0"
+        bind_addr = getattr(args, "address", None) or "192.168.31.36/24"
         bind_port = getattr(args, "port", None) or 47808
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
