@@ -97,7 +97,7 @@ def dump_obj_debug(prefix: str, obj) -> None:
 # -----------------------------------------------------------
 # YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CFG_DIR = "/config/bacnet_hub"
+DEFAULT_CFG_DIR = "/config/bacnet-hub"
 DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
 DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
 
@@ -307,7 +307,7 @@ class Server:
         dev = cfg.get("device", {}) or {}
         objs = cfg.get("objects", []) or []
         self.cfg_device = {
-            "device_id": int(dev.get("device_id", 500000)),
+            "device_id": int(dev.get("device_id", 3600)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
