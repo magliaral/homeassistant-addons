@@ -66,7 +66,7 @@ args: argparse.Namespace
 service: Application
 
 # Pfad zur HA-Konfiguration
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
