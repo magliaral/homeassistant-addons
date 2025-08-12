@@ -1,83 +1,107 @@
-"""
-FastAPI-basierter einfacher RPC-Server für Home Assistant Add-on
-
-Liest Konfiguration aus /config/bacnet-hub/mappings.yaml:
-  server:
-    host: 0.0.0.0
-    port: 8000
-    log_level: info
-  bacpypes:
-    # EINE von beiden Varianten:
-    # 1) Liste der BACpypes-CLI-Argumente (roh)
-    args:
-      - --device-instance
-      - "1234"
-      - --address
-      - "0.0.0.0"
-    # 2) Oder als Dictionary (wird zu Flags konvertiert)
-    # options:
-    #   device_instance: 1234
-    #   address: "0.0.0.0"
-    #   no_who_is: true   # bool -> nur Flag, wenn True
-
-Erforderliche Pakete:
-  fastapi
-  uvicorn[standard]
-  pyyaml
-  bacpypes3
-"""
-
 from __future__ import annotations
 
-import os
-import sys
 import asyncio
-import argparse
-from contextlib import asynccontextmanager
-from typing import Optional, Any, Dict, List, Union
-
-import uvicorn
+import inspect
+import io
+import json
+import logging
+import os
 import yaml
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from bacpypes3.debugging import ModuleLogger
-from bacpypes3.argparse import SimpleArgumentParser
-
-from bacpypes3.pdu import Address, GlobalBroadcast
-from bacpypes3.primitivedata import Atomic, ObjectIdentifier
-from bacpypes3.constructeddata import Sequence, AnyAtomic, Array, List
-from bacpypes3.apdu import ErrorRejectAbortNack
-from bacpypes3.app import Application
-
-from bacpypes3.settings import settings
-from bacpypes3.json.util import (
-    atomic_encode,
-    sequence_to_json,
-    extendedlist_to_json_list,
+# -----------------------------------------------------------
+# Grund-Logging
+# -----------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+LOG = logging.getLogger("bacnet_hub_addon")
 
-# Debugging
-_debug = 1
+# -----------------------------------------------------------
+# Add-on Optionen
+# -----------------------------------------------------------
+def load_addon_options() -> Dict[str, Any]:
+    try:
+        with open("/data/options.json", "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+OPTS = load_addon_options()
+HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
+LLAT = (OPTS.get("long_lived_token") or "").strip() or None
+BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
+
+# -----------------------------------------------------------
+# bacpypes3 Debugging (ModuleLogger + Decorator)
+# -----------------------------------------------------------
+try:
+    from bacpypes3.debugging import bacpypes_debugging, ModuleLogger  # type: ignore
+except Exception:
+    def bacpypes_debugging(cls):  # no-op
+        return cls
+    class ModuleLogger:
+        def __init__(self, _): pass
+        def __getattr__(self, _): return lambda *a, **k: None
+
+_debug = 1 if BACPYPES_LOG_LEVEL == "debug" else 0
 _log = ModuleLogger(globals())
 
-# Globale Variablen
-args: argparse.Namespace
-service: Application
+def configure_bacpypes_debug(level_name: str):
+    level_map = {
+        "debug": logging.DEBUG, "info": logging.INFO,
+        "warning": logging.WARNING, "error": logging.ERROR,
+    }
+    level = level_map.get((level_name or "info").lower(), logging.INFO)
 
-# Pfad zur HA-Konfiguration
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+    # damit ModuleLogger-Ausgaben sichtbar werden
+    if level == logging.DEBUG:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("__main__").setLevel(logging.DEBUG)
+        logging.getLogger(__name__).setLevel(logging.DEBUG)
+        LOG.setLevel(logging.DEBUG)
 
+    logging.getLogger("bacpypes3").setLevel(level)
+    for name in (
+        "bacpypes3.app","bacpypes3.comm","bacpypes3.pdu","bacpypes3.apdu",
+        "bacpypes3.netservice","bacpypes3.service","bacpypes3.local",
+    ):
+        logging.getLogger(name).setLevel(level)
+
+    LOG.info("bacpypes3 logger level set to '%s'", level_name)
+
+configure_bacpypes_debug(BACPYPES_LOG_LEVEL)
+
+# -----------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------
+async def maybe_await(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+def dump_obj_debug(prefix: str, obj) -> None:
+    try:
+        buf = io.StringIO()
+        if hasattr(obj, "debug_contents"):
+            obj.debug_contents(file=buf)  # type: ignore[attr-defined]
+            LOG.debug("%s\n%s", prefix, buf.getvalue().rstrip())
+        else:
+            LOG.debug("%s %r (no debug_contents)", prefix, obj)
+    except Exception as exc:
+        LOG.debug("%s dump failed: %s", prefix, exc)
+
+# -----------------------------------------------------------
+# YAML laden und argv für BACpypes bauen (wie in deinem Beispiel)
+# -----------------------------------------------------------
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
-    """
-    YAML-Konfiguration vom Datenträger laden.
-    Gibt ein leeres Dict zurück, wenn Datei fehlt oder leer ist.
-    """
     if not os.path.exists(path):
         _log.warning("Konfigurationsdatei nicht gefunden: %s", path)
         return {}
-
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -88,23 +112,15 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
         _log.error("Fehler beim Laden von YAML %s: %r", path, err)
         return {}
 
-
 def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
-    """
-    Dict -> CLI-Argumentliste (z.B. {'device_instance': 123, 'no_who_is': True}
-    wird zu ['--device-instance', '123', '--no-who-is']).
-    """
     argv: List[str] = []
-    for key, value in options.items():
-        flag = f"--{str(key).replace('_', '-')}"
-        # Bool: True -> nur Flag setzen, False -> weglassen
+    for key, value in (options or {}).items():
+        flag = f"--{str(key).replace('_','-')}"
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
-        # None -> ignorieren
         elif value is None:
             continue
-        # Liste/Tuple -> mehrfach setzen
         elif isinstance(value, (list, tuple)):
             for item in value:
                 argv.extend([flag, str(item)])
@@ -112,179 +128,335 @@ def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
             argv.extend([flag, str(value)])
     return argv
 
-
 def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
-    """
-    Erzeuge eine vollständige argv-Liste aus YAML:
-    - BACpypes-Argumente (aus 'bacpypes.args' oder 'bacpypes.options')
-    - Server-Argumente (--host, --port, --log-level)
-    """
     argv: List[str] = []
-
-    # BACpypes
     bac = config.get("bacpypes", {}) or {}
     if "args" in bac and isinstance(bac["args"], list):
         argv.extend([str(x) for x in bac["args"]])
     elif "options" in bac and isinstance(bac["options"], dict):
         argv.extend(_bacpypes_dict_to_argv(bac["options"]))
 
-    # Server
-    server_cfg = config.get("server", {}) or {}
-    host = str(server_cfg.get("host", os.getenv("BACNET_HUB_HOST", "0.0.0.0")))
-    port = int(server_cfg.get("port", os.getenv("BACNET_HUB_PORT", "8000")))
-    log_level = str(server_cfg.get("log_level", os.getenv("BACNET_HUB_LOG_LEVEL", "info")))
-
-    argv.extend(["--host", host, "--port", str(port), "--log-level", log_level])
+    # device: (fallbacks → häufige Keys mappen)
+    dev = config.get("device", {}) or {}
+    # falls nicht in bacpypes.options gesetzt, ergänzen:
+    if "--device-instance" not in argv and "-i" not in argv and dev.get("device_id"):
+        argv.extend(["--device-instance", str(int(dev["device_id"]))])
+    if dev.get("address"):
+        argv.extend(["--address", str(dev["address"])])
+    if dev.get("port"):
+        argv.extend(["--port", str(int(dev["port"]))])
 
     if _debug:
         _log.debug("Finale argv aus YAML: %r", argv)
     return argv
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    FastAPI-Lebenszyklus: baut die BACpypes Application aus den geparsten Argumenten.
-    """
-    global args, service
-    service = Application.from_args(args)
-    if _debug:
-        _log.debug("lifespan service: %r", service)
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-@app.get("/")
-async def root():
-    """Zur API-Doku umleiten."""
-    return RedirectResponse("/docs")
-
-
-@app.get("/config")
-async def get_config():
-    """
-    Konfiguration als JSON zurückgeben (BACpypes settings + Application-Objekte).
-    """
-    global service
-
-    object_list = []
-    for obj in service.objectIdentifier.values():
-        object_list.append(sequence_to_json(obj))
-
-    return {"BACpypes": dict(settings), "application": object_list}
-
-
-@app.get("/{device_instance}")
-async def who_is(device_instance: int, address: Optional[str] = None):
-    """
-    Who-Is senden und I-Am-Antworten zurückgeben.
-    """
-    global service
-
-    destination: Address = Address(address) if address else GlobalBroadcast()
-    i_ams = await service.who_is(device_instance, device_instance, destination)
-
-    return [sequence_to_json(i_am) for i_am in i_ams]
-
-
-async def _read_property(
-    device_instance: int, object_identifier: str, property_identifier: str
-):
-    """
-    Eine Eigenschaft eines Objekts lesen.
-    """
-    global service
-
-    device_info = service.device_info_cache.instance_cache.get(device_instance, None)
-    if device_info:
-        device_address = device_info.device_address
-    else:
-        i_ams = await service.who_is(device_instance, device_instance)
-        if not i_ams:
-            raise HTTPException(status_code=400, detail=f"device not found: {device_instance}")
-        if len(i_ams) > 1:
-            raise HTTPException(status_code=400, detail=f"multiple devices: {device_instance}")
-        device_address = i_ams[0].pduSource
-
-    try:
-        property_value = await service.read_property(
-            device_address, ObjectIdentifier(object_identifier), property_identifier
+# -----------------------------------------------------------
+# HA WebSocket Client
+# -----------------------------------------------------------
+class HAWS:
+    def __init__(self):
+        self.url = HA_URL
+        self.token = (
+            os.getenv("SUPERVISOR_TOKEN")
+            or os.getenv("HASSIO_TOKEN")
+            or os.getenv("HOME_ASSISTANT_TOKEN")
+            or os.getenv("HOMEASSISTANT_TOKEN")
+            or LLAT
         )
-    except ErrorRejectAbortNack as err:
-        raise HTTPException(status_code=400, detail=f"error/reject/abort: {err}")
+        if not self.token:
+            raise RuntimeError(
+                "No token found. Enable homeassistant_api in add-on config "
+                "or set a long_lived_token option."
+            )
+        self.ws = None
+        self._id = 1
+        self.state_cache: Dict[str, Dict[str, Any]] = {}
 
-    if isinstance(property_value, AnyAtomic):
-        property_value = property_value.get_value()
+    async def connect(self):
+        import websockets
+        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
+        first = json.loads(await self.ws.recv())
+        if first.get("type") == "auth_required":
+            await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+            ok = json.loads(await self.ws.recv())
+            if ok.get("type") != "auth_ok":
+                raise RuntimeError(f"WS auth failed: {ok}")
+        LOG.info("HA WebSocket connected")
 
-    if isinstance(property_value, Atomic):
-        encoded_value = atomic_encode(property_value)
-    elif isinstance(property_value, Sequence):
-        encoded_value = sequence_to_json(property_value)
-    elif isinstance(property_value, (Array, List)):
-        encoded_value = extendedlist_to_json_list(property_value)
-    else:
-        raise HTTPException(status_code=400, detail=f"JSON encoding: {property_value}")
+    async def call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.ws:
+            raise RuntimeError("WS not connected")
+        payload = dict(payload)
+        payload.setdefault("id", self._id)
+        self._id += 1
+        await self.ws.send(json.dumps(payload))
+        while True:
+            msg = json.loads(await self.ws.recv())
+            if msg.get("id") == payload["id"]:
+                return msg
 
-    return {property_identifier: encoded_value}
+    async def prime_states(self):
+        res = await self.call({"type": "get_states"})
+        states = res.get("result", res.get("data", [])) or []
+        for s in states:
+            self.state_cache[s["entity_id"]] = s
 
+    async def subscribe_state_changes(self, on_event):
+        sub_id = self._id
+        self._id += 1
+        await self.ws.send(json.dumps(
+            {"id": sub_id, "type": "subscribe_events", "event_type": "state_changed"}
+        ))
 
-@app.get("/{device_instance}/{object_identifier}")
-async def read_present_value(device_instance: int, object_identifier: str):
-    """present-value lesen."""
-    return await _read_property(device_instance, object_identifier, "present-value")
+        async def _loop():
+            while True:
+                raw = await self.ws.recv()
+                evt = json.loads(raw)
+                if evt.get("type") == "event" and evt.get("event", {}).get("event_type") == "state_changed":
+                    data = evt["event"]["data"]
+                    ent_id = data["entity_id"]
+                    self.state_cache[ent_id] = data.get("new_state") or {}
+                    await on_event(data)
 
+        asyncio.create_task(_loop())
 
-@app.get("/{device_instance}/{object_identifier}/{property_identifier}")
-async def read_property(
-    device_instance: int, object_identifier: str, property_identifier: str
-):
-    """Beliebige Eigenschaft lesen."""
-    return await _read_property(device_instance, object_identifier, property_identifier)
+    def get_value(self, entity_id: str, mode="state", attr: Optional[str] = None, analog=False):
+        st = self.state_cache.get(entity_id)
+        if not st:
+            return None
+        val = st.get("state") if mode == "state" else (st.get("attributes") or {}).get(attr)
+        if analog:
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+        return str(val).lower() in ("on","true","1","open","heat","cool")
 
+    async def call_service(self, domain: str, service: str, data: Dict[str, Any]):
+        res = await self.call({"type": "call_service", "domain": domain, "service": service, "service_data": data})
+        if not res.get("success", True):
+            LOG.warning("Service call failed: %s", res)
 
-async def main() -> None:
-    """
-    Startpunkt:
-      - YAML laden
-      - Argumente aus YAML -> argparse
-      - FastAPI/Uvicorn starten
-    """
-    global args, app
+# -----------------------------------------------------------
+# Mapping / Objektdefinition
+# -----------------------------------------------------------
+@dataclass
+class Mapping:
+    entity_id: str
+    object_type: str        # analogValue | binaryValue
+    instance: int
+    units: Optional[str] = None
+    writable: bool = False
+    mode: str = "state"     # state | attr
+    attr: Optional[str] = None
+    name: Optional[str] = None
+    write: Optional[Dict[str, Any]] = None
 
-    # YAML-Pfad kann optional via ENV überschrieben werden
-    cfg_path = os.getenv("BACNET_HUB_CONFIG", DEFAULT_CONFIG_PATH)
-    cfg = _load_yaml_config(cfg_path)
+ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
+SUPPORTED_TYPES = {"analogValue","binaryValue"}
 
-    # Argumentparser aufbauen (inkl. unserer Server-Flags)
-    parser = SimpleArgumentParser()
-    parser.add_argument("--host", help="Host-Adresse für den Webservice", default="0.0.0.0")
-    parser.add_argument("--port", type=int, help="Port für den Webservice", default=8000)
-    parser.add_argument("--log-level", help="uvicorn log level", default="info")
+# -----------------------------------------------------------
+# BACpypes Imports (lazy)
+# -----------------------------------------------------------
+def import_bacpypes():
+    from importlib import import_module
+    _Application = import_module("bacpypes3.app").Application
+    _SimpleArgumentParser = import_module("bacpypes3.argparse").SimpleArgumentParser
+    _DeviceObject = import_module("bacpypes3.local.device").DeviceObject
+    _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
+    _Address = import_module("bacpypes3.pdu").Address
 
-    # argv aus YAML generieren und parsen
-    yaml_argv = _build_argv_from_yaml(cfg)
-    # Hinweis: Wir parsen NICHT aus sys.argv, sondern rein aus YAML.
-    args = parser.parse_args(yaml_argv)
+    # Objektklassen robust finden
+    AV = BV = None
+    for mod, av, bv in [
+        ("bacpypes3.local.object", "AnalogValueObject", "BinaryValueObject"),
+        ("bacpypes3.local.objects.value", "AnalogValueObject", None),
+        ("bacpypes3.local.objects.binary", None, "BinaryValueObject"),
+        ("bacpypes3.local.analog", "AnalogValueObject", None),
+        ("bacpypes3.local.binary", None, "BinaryValueObject"),
+    ]:
+        try:
+            m = import_module(mod)
+            if av and hasattr(m, av): AV = getattr(m, av)
+            if bv and hasattr(m, bv): BV = getattr(m, bv)
+        except Exception:
+            pass
+    if not AV or not BV:
+        raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    if _debug:
-        _log.debug("Args nach parse_args(yaml_argv): %r", args)
+    return _Application, _SimpleArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
 
-    # Uvicorn starten
-    config = uvicorn.Config(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level,
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
+# -----------------------------------------------------------
+# Server
+# -----------------------------------------------------------
+class Server:
+    def __init__(self, cfg_path: str = DEFAULT_CONFIG_PATH):
+        self.cfg_path = cfg_path
+        self.cfg: Dict[str, Any] = {}
+        self.mappings: List[Mapping] = []
 
+        self.ha: Optional[HAWS] = None
+        self.app = None
+        self.device = None
 
+    def load_config(self) -> Dict[str, Any]:
+        cfg = _load_yaml_config(self.cfg_path)
+        dev = cfg.get("device", {}) or {}
+        objs = cfg.get("objects", []) or []
+        self.cfg = {
+            "device_id": int(dev.get("device_id", 500000)),
+            "name": dev.get("name") or "BACnet Hub",
+        }
+        self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
+        return cfg
+
+    async def _add_object(self, app, m: Mapping, AV, BV):
+        key = (m.object_type, m.instance)
+        name = m.name or m.entity_id
+
+        if m.object_type == "analogValue":
+            obj = AV(objectIdentifier=key, objectName=name, presentValue=0.0)
+            if m.units and hasattr(obj, "units"):
+                units = ENGINEERING_UNITS_ENUM.get(m.units)
+                if units is not None:
+                    obj.units = units  # type: ignore
+
+            if hasattr(obj, "ReadProperty"):
+                orig = obj.ReadProperty
+                async def dyn_read(prop, arrayIndex=None):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                        try:
+                            obj.presentValue = float(val or 0.0)  # type: ignore
+                        except Exception:
+                            obj.presentValue = 0.0  # type: ignore
+                    return await maybe_await(orig(prop, arrayIndex))
+                obj.ReadProperty = dyn_read  # type: ignore
+
+            if hasattr(obj, "WriteProperty") and m.writable:
+                origw = obj.WriteProperty
+                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        await self._write_to_ha(m, value)
+                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
+                obj.WriteProperty = dyn_write  # type: ignore
+
+        else:  # binaryValue
+            obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
+            if hasattr(obj, "ReadProperty"):
+                orig = obj.ReadProperty
+                async def dyn_read(prop, arrayIndex=None):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                        obj.presentValue = bool(val)  # type: ignore
+                    return await maybe_await(orig(prop, arrayIndex))
+                obj.ReadProperty = dyn_read  # type: ignore
+
+            if hasattr(obj, "WriteProperty") and m.writable:
+                origw = obj.WriteProperty
+                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        await self._write_to_ha(m, value)
+                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
+                obj.WriteProperty = dyn_write  # type: ignore
+
+        await maybe_await(app.add_object(obj))
+        LOG.info("Added %s:%s -> %s", *key, m.entity_id)
+
+    async def _write_to_ha(self, m: Mapping, value):
+        svc = (m.write or {}).get("service")
+        if not (m.writable and svc):
+            return
+        if svc.endswith(".turn_on_off"):
+            domain = svc.split(".",1)[0]
+            name = "turn_on" if str(value).lower() in ("1","true","on","active") else "turn_off"
+            await self.ha.call_service(domain, name, {"entity_id": m.entity_id})
+            return
+        if "." in svc:
+            domain, service = svc.split(".",1)
+            data = {"entity_id": m.entity_id}
+            payload_key = (m.write or {}).get("payload_key")
+            if payload_key:
+                data[payload_key] = value
+            await self.ha.call_service(domain, service, data)
+
+    async def start(self):
+        # 1) YAML laden → argv für BACpypes bauen
+        cfg = self.load_config()
+        argv = _build_argv_from_yaml(cfg)
+
+        # 2) HA verbinden
+        self.ha = HAWS()
+        await self.ha.connect()
+        await self.ha.prime_states()
+        await self.ha.subscribe_state_changes(self._on_state_changed)
+
+        # 3) BACpypes importieren
+        Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+
+        # 4) Parser wie im Beispiel + Application.from_args
+        parser = SimpleArgumentParser()
+        # (wir parsen **nur** argv aus YAML, nicht sys.argv)
+        args = parser.parse_args(argv)
+
+        # App aus Args erstellen (dein funktionierendes Pattern)
+        app = Application.from_args(args)
+        self.app = app
+
+        # lokales Device holen (liegt in der Application)
+        # in neueren Versionen: app.local_device; ansonsten im objectIdentifier-Index
+        dev = getattr(app, "local_device", None)
+        if not dev:
+            # heuristik: erstes DeviceObject aus app.objectIdentifier
+            for obj in app.objectIdentifier.values():
+                if isinstance(obj, DeviceObject):
+                    dev = obj
+                    break
+        self.device = dev
+
+        if _debug:
+            LOG.debug("args: %r", vars(args))
+            LOG.debug("settings: %s", dict(getattr(__import__("bacpypes3.settings","*"), "settings", {})))
+        # Bind-Adresse aus Args extrahieren (nur fürs Log)
+        bind_addr = getattr(args, "address", None) or "0.0.0.0"
+        bind_port = getattr(args, "port", None) or 47808
+        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg["device_id"])
+        LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
+        if self.device:
+            LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
+        LOG.debug("app: %r", self.app)
+
+        # 5) Objekte anlegen
+        for m in self.mappings:
+            if m.object_type not in SUPPORTED_TYPES:
+                LOG.warning("Unsupported type %s", m.object_type); continue
+            await self._add_object(self.app, m, AV, BV)
+
+    async def _on_state_changed(self, event):
+        return  # (COV später)
+
+    async def run_forever(self):
+        await self.start()
+        stopper = asyncio.Event()
+        try:
+            await stopper.wait()
+        finally:
+            if self.app:
+                close = getattr(self.app, "close", None)
+                if callable(close):
+                    res = close()
+                    if inspect.isawaitable(res):
+                        await res
+
+# -----------------------------------------------------------
+# Main
+# -----------------------------------------------------------
 if __name__ == "__main__":
-    # Für HA-Add-on: einfach python3 server.py
     try:
-        asyncio.run(main())
+        asyncio.run(Server().run_forever())
     except KeyboardInterrupt:
         pass
