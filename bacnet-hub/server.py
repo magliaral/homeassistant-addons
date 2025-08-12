@@ -48,7 +48,7 @@ except Exception:
         def __init__(self, _): pass
         def __getattr__(self, _): return lambda *a, **k: None
 
-_debug = 1
+_debug = 1 if BACPYPES_LOG_LEVEL == "debug" else 0
 _log = ModuleLogger(globals())
 
 def configure_bacpypes_debug(level_name: str):
@@ -282,6 +282,12 @@ def import_bacpypes():
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
 
+    # Typen zum Entpacken:
+    _prim = import_module("bacpypes3.primitivedata")
+    AnyPD = getattr(_prim, "Any")
+    RealPD = getattr(_prim, "Real")
+    BooleanPD = getattr(_prim, "Boolean")
+
     AV = BV = None
     for mod, av, bv in [
         ("bacpypes3.local.object", "AnalogValueObject", "BinaryValueObject"),
@@ -312,13 +318,14 @@ def import_bacpypes():
     WritePropertyMultipleRequest = getattr(_apdu, "WritePropertyMultipleRequest", None)
 
     return (_Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject,
-            AV, BV, _Unsigned, _Address, BinaryPV, WritePropertyRequest, WritePropertyMultipleRequest)
+            AV, BV, _Unsigned, _Address, BinaryPV, WritePropertyRequest, WritePropertyMultipleRequest,
+            AnyPD, RealPD, BooleanPD)
 
 # -----------------------------------------------------------
 # Custom Local Objects (Overrides)
 # -----------------------------------------------------------
 class CustomAnalogValueObject:
-    def __init__(self, base_cls, mapping: Mapping, server: "Server"):
+    def __init__(self, base_cls, mapping: Mapping, server: "Server", AnyPD, RealPD):
         class _AV(base_cls):  # type: ignore[misc]
             async def ReadProperty(self, prop, arrayIndex=None):  # type: ignore[override]
                 if _pid_is_present_value(prop) and server.ha:
@@ -332,7 +339,13 @@ class CustomAnalogValueObject:
             async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
                 if _pid_is_present_value(prop) and server.ha and mapping.writable:
                     raw = value
+                    # --- Any → Real entpacken ---
                     try:
+                        if isinstance(raw, AnyPD):
+                            try:
+                                raw = raw.cast(RealPD).get_value()
+                            except Exception:
+                                raw = raw.get_value()
                         if hasattr(raw, "get_value"):
                             raw = raw.get_value()
                         elif hasattr(raw, "value"):
@@ -349,7 +362,7 @@ class CustomAnalogValueObject:
         self.cls = _AV
 
 class CustomBinaryValueObject:
-    def __init__(self, base_cls, mapping: Mapping, server: "Server", BinaryPV):
+    def __init__(self, base_cls, mapping: Mapping, server: "Server", BinaryPV, AnyPD, BooleanPD):
         class _BV(base_cls):  # type: ignore[misc]
             async def ReadProperty(self, prop, arrayIndex=None):  # type: ignore[override]
                 if _pid_is_present_value(prop) and server.ha:
@@ -360,8 +373,24 @@ class CustomBinaryValueObject:
             async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
                 if _pid_is_present_value(prop) and server.ha and mapping.writable:
                     raw = value
+                    # --- Any → BinaryPV / Boolean entpacken ---
                     try:
-                        if hasattr(raw, "get_value"):
+                        if isinstance(raw, AnyPD):
+                            # Erst versuchen BinaryPV (active/inactive), sonst Boolean
+                            if BinaryPV is not None:
+                                try:
+                                    raw = raw.cast(BinaryPV).get_value()
+                                except Exception:
+                                    pass
+                            if hasattr(raw, "get_value"):
+                                raw = raw.get_value()
+                            # Falls immer noch Any → Boolean probieren:
+                            if isinstance(raw, AnyPD):
+                                try:
+                                    raw = raw.cast(BooleanPD).get_value()
+                                except Exception:
+                                    raw = str(raw)
+                        elif hasattr(raw, "get_value"):
                             raw = raw.get_value()
                         elif hasattr(raw, "value"):
                             raw = raw.value
@@ -376,6 +405,7 @@ class CustomBinaryValueObject:
                         on = False
                     elif "active" in s:
                         on = True
+                    # Enum direkt vergleichen:
                     if not on and BinaryPV is not None:
                         try:
                             if raw == getattr(BinaryPV, "active"):
@@ -473,19 +503,19 @@ class Server:
         parser = SimpleArgumentParser()
         return parser.parse_args(argv)
 
-    async def _add_object(self, app, m: Mapping, AV, BV, BinaryPV):
+    async def _add_object(self, app, m: Mapping, AV, BV, BinaryPV, AnyPD, RealPD, BooleanPD):
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
         if m.object_type == "analogValue":
-            AVCls = CustomAnalogValueObject(AV, m, self).cls
+            AVCls = CustomAnalogValueObject(AV, m, self, AnyPD, RealPD).cls
             obj = AVCls(objectIdentifier=key, objectName=name, presentValue=0.0)
             if m.units and hasattr(obj, "units"):
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
                     obj.units = units  # type: ignore[attr-defined]
         else:
-            BVCls = CustomBinaryValueObject(BV, m, self, BinaryPV).cls
+            BVCls = CustomBinaryValueObject(BV, m, self, BinaryPV, AnyPD, BooleanPD).cls
             obj = BVCls(objectIdentifier=key, objectName=name, presentValue=False)
 
         await maybe_await(app.add_object(obj))
@@ -557,7 +587,8 @@ class Server:
 
         # 3) BACpypes importieren & Parser/Args vorbereiten
         (BaseApplication, SimpleArgumentParser, YAMLArgumentParser, DeviceObject,
-         AV, BV, Unsigned, Address, BinaryPV, WPR, WPMR) = import_bacpypes()
+         AV, BV, Unsigned, Address, BinaryPV, WPR, WPMR,
+         AnyPD, RealPD, BooleanPD) = import_bacpypes()
 
         # 4) Custom Application-Klasse mit Write-APDU-Logging
         CustomApplication = make_custom_application(BaseApplication, WPR, WPMR)
@@ -598,7 +629,7 @@ class Server:
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
-            await self._add_object(self.app, m, AV, BV, BinaryPV)
+            await self._add_object(self.app, m, AV, BV, BinaryPV, AnyPD, RealPD, BooleanPD)
 
         # 7) Initiale Synchronisierung
         await self._initial_sync()
