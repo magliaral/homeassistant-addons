@@ -33,6 +33,13 @@ HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/webs
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "debug").lower()
 
+if BACPYPES_LOG_LEVEL == "debug":
+    # Root-Logger & Modul-Logger auf DEBUG
+    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger("__main__").setLevel(logging.DEBUG)
+    logging.getLogger(__name__).setLevel(logging.DEBUG)
+    LOG.setLevel(logging.DEBUG)
+
 # -----------------------------------------------------------
 # bacpypes3 Debug: Decorator + ModuleLogger import (mit Fallback)
 # -----------------------------------------------------------
