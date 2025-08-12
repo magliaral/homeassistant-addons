@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -94,22 +95,20 @@ def dump_obj_debug(prefix: str, obj) -> None:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
 # -----------------------------------------------------------
-# YAML laden und argv für BACpypes bauen
+# YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CFG_DIR = "/config/bacnet_hub"
+DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
+DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
 
-def _load_yaml_config(path: str) -> Dict[str, Any]:
+def _load_yaml(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        _log.warning("Konfigurationsdatei nicht gefunden: %s", path)
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-            if _debug:
-                _log.debug("Geladene YAML: %r", data)
-            return data
+            return yaml.safe_load(f) or {}
     except Exception as err:
-        _log.error("Fehler beim Laden von YAML %s: %r", path, err)
+        LOG.warning("Fehler beim Laden von YAML %s: %r", path, err)
         return {}
 
 def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
@@ -146,7 +145,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
         argv.extend(["--port", str(int(dev["port"]))])
 
     if _debug:
-        _log.debug("Finale argv aus YAML: %r", argv)
+        LOG.debug("Finale argv aus YAML: %r", argv)
     return argv
 
 # -----------------------------------------------------------
@@ -215,7 +214,7 @@ class HAWS:
                     data = evt["event"]["data"]
                     ent_id = data["entity_id"]
                     self.state_cache[ent_id] = data.get("new_state") or {}
-                    await on_event(data)   # wir geben nur den 'data'-Teil weiter
+                    await on_event(data)
 
         asyncio.create_task(_loop())
 
@@ -261,6 +260,7 @@ def import_bacpypes():
     from importlib import import_module
     _Application = import_module("bacpypes3.app").Application
     _SimpleArgumentParser = import_module("bacpypes3.argparse").SimpleArgumentParser
+    _YAMLArgumentParser = import_module("bacpypes3.argparse").YAMLArgumentParser
     _DeviceObject = import_module("bacpypes3.local.device").DeviceObject
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
@@ -282,7 +282,7 @@ def import_bacpypes():
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    return _Application, _SimpleArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
+    return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
 
 # -----------------------------------------------------------
 # Server
@@ -290,7 +290,8 @@ def import_bacpypes():
 class Server:
     def __init__(self, cfg_path: str = DEFAULT_CONFIG_PATH):
         self.cfg_path = cfg_path
-        self.cfg: Dict[str, Any] = {}
+        self.cfg_all: Dict[str, Any] = {}
+        self.cfg_device: Dict[str, Any] = {}
         self.mappings: List[Mapping] = []
 
         self.ha: Optional[HAWS] = None
@@ -300,16 +301,47 @@ class Server:
         # entity_id -> bacpypes Objekt (für schnelle Updates)
         self.entity_index: Dict[str, Any] = {}
 
-    def load_config(self) -> Dict[str, Any]:
-        cfg = _load_yaml_config(self.cfg_path)
+    def load_config(self) -> None:
+        cfg = _load_yaml(self.cfg_path)
+        self.cfg_all = cfg
         dev = cfg.get("device", {}) or {}
         objs = cfg.get("objects", []) or []
-        self.cfg = {
+        self.cfg_device = {
             "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
-        return cfg
+
+    def build_bacpypes_args(self, YAMLArgumentParser, SimpleArgumentParser):
+        """
+        Präferenz:
+          1) /config/bacnet_hub/bacpypes.yml
+          2) bacpypes_yaml: {} in mappings.yaml
+          3) Fallback: bacpypes.options/args + device-Felder
+        """
+        # 1) eigene bacpypes.yml?
+        if os.path.exists(DEFAULT_BACPY_YAML_PATH):
+            parser = YAMLArgumentParser()
+            return parser.parse_args(["--yaml", DEFAULT_BACPY_YAML_PATH])
+
+        # 2) eingebetteter Block in mappings.yaml?
+        bp_yaml = self.cfg_all.get("bacpypes_yaml")
+        if isinstance(bp_yaml, dict):
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yml") as tf:
+                yaml.safe_dump(bp_yaml, tf)
+                temp_path = tf.name
+            parser = YAMLArgumentParser()
+            args = parser.parse_args(["--yaml", temp_path])
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            return args
+
+        # 3) Fallback: argv bauen
+        argv = _build_argv_from_yaml(self.cfg_all)
+        parser = SimpleArgumentParser()
+        return parser.parse_args(argv)
 
     async def _add_object(self, app, m: Mapping, AV, BV):
         key = (m.object_type, m.instance)
@@ -444,24 +476,38 @@ class Server:
 
         LOG.debug("Unbekanntes Serviceformat: %s", svc)
 
+    async def _initial_sync(self):
+        """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben."""
+        for m in self.mappings:
+            obj = self.entity_index.get(m.entity_id)
+            if not obj:
+                continue
+            if m.object_type == "analogValue":
+                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                try:
+                    obj.presentValue = float(val or 0.0)  # type: ignore
+                except Exception:
+                    obj.presentValue = 0.0  # type: ignore
+                LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
+            else:
+                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                obj.presentValue = bool(val)  # type: ignore
+                LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
+
     async def start(self):
-        # 1) YAML laden → argv für BACpypes bauen
-        cfg = self.load_config()
-        argv = _build_argv_from_yaml(cfg)
+        # 1) YAML laden
+        self.load_config()
 
         # 2) HA verbinden
         self.ha = HAWS()
         await self.ha.connect()
         await self.ha.prime_states()
-        await self.ha.subscribe_state_changes(self._on_state_changed)
 
-        # 3) BACpypes importieren
-        Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
+        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
-        # 4) Parser + Application.from_args (wie im funktionierenden Beispiel)
-        parser = SimpleArgumentParser()
-        args = parser.parse_args(argv)  # nur YAML-argv
-
+        # 4) Application starten (wie in deinem funktionierenden Beispiel)
         app = Application.from_args(args)
         self.app = app
 
@@ -474,7 +520,7 @@ class Server:
                     break
         self.device = dev
 
-        # Logs wie erwartet
+        # Logs
         if _debug:
             try:
                 from bacpypes3.settings import settings as bp_settings
@@ -485,7 +531,7 @@ class Server:
 
         bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
-        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg["device_id"])
+        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
         if self.device:
             LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
@@ -496,6 +542,12 @@ class Server:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
             await self._add_object(self.app, m, AV, BV)
+
+        # 6) **Initiale Synchronisierung**
+        await self._initial_sync()
+
+        # 7) Live-Events abonnieren
+        await self.ha.subscribe_state_changes(self._on_state_changed)
 
     async def _on_state_changed(self, data: Dict[str, Any]):
         """Live-Update der presentValue bei HA-Änderungen."""
