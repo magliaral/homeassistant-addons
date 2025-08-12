@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -94,22 +95,20 @@ def dump_obj_debug(prefix: str, obj) -> None:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
 # -----------------------------------------------------------
-# YAML laden und argv für BACpypes bauen
+# YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CFG_DIR = "/config/bacnet-hub"
+DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
+DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
 
-def _load_yaml_config(path: str) -> Dict[str, Any]:
+def _load_yaml(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        _log.warning("Konfigurationsdatei nicht gefunden: %s", path)
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-            if _debug:
-                _log.debug("Geladene YAML: %r", data)
-            return data
+            return yaml.safe_load(f) or {}
     except Exception as err:
-        _log.error("Fehler beim Laden von YAML %s: %r", path, err)
+        LOG.warning("Fehler beim Laden von YAML %s: %r", path, err)
         return {}
 
 def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
@@ -146,7 +145,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
         argv.extend(["--port", str(int(dev["port"]))])
 
     if _debug:
-        _log.debug("Finale argv aus YAML: %r", argv)
+        LOG.debug("Finale argv aus YAML: %r", argv)
     return argv
 
 # -----------------------------------------------------------
@@ -215,7 +214,7 @@ class HAWS:
                     data = evt["event"]["data"]
                     ent_id = data["entity_id"]
                     self.state_cache[ent_id] = data.get("new_state") or {}
-                    await on_event(data)   # wir geben nur den 'data'-Teil weiter
+                    await on_event(data)
 
         asyncio.create_task(_loop())
 
@@ -261,6 +260,7 @@ def import_bacpypes():
     from importlib import import_module
     _Application = import_module("bacpypes3.app").Application
     _SimpleArgumentParser = import_module("bacpypes3.argparse").SimpleArgumentParser
+    _YAMLArgumentParser = import_module("bacpypes3.argparse").YAMLArgumentParser
     _DeviceObject = import_module("bacpypes3.local.device").DeviceObject
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
@@ -282,7 +282,7 @@ def import_bacpypes():
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    return _Application, _SimpleArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
+    return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
 
 # -----------------------------------------------------------
 # Server
@@ -290,26 +290,58 @@ def import_bacpypes():
 class Server:
     def __init__(self, cfg_path: str = DEFAULT_CONFIG_PATH):
         self.cfg_path = cfg_path
-        self.cfg: Dict[str, Any] = {}
+        self.cfg_all: Dict[str, Any] = {}
+        self.cfg_device: Dict[str, Any] = {}
         self.mappings: List[Mapping] = []
 
         self.ha: Optional[HAWS] = None
         self.app = None
         self.device = None
 
-        # NEU: entity_id -> bacpypes Objekt (für schnelle Updates)
+        # entity_id -> bacpypes Objekt (für schnelle Updates)
         self.entity_index: Dict[str, Any] = {}
 
-    def load_config(self) -> Dict[str, Any]:
-        cfg = _load_yaml_config(self.cfg_path)
+    def load_config(self) -> None:
+        cfg = _load_yaml(self.cfg_path)
+        self.cfg_all = cfg
         dev = cfg.get("device", {}) or {}
         objs = cfg.get("objects", []) or []
-        self.cfg = {
+        self.cfg_device = {
             "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
-        return cfg
+
+    def build_bacpypes_args(self, YAMLArgumentParser, SimpleArgumentParser):
+        """
+        Präferenz:
+          1) /config/bacnet_hub/bacpypes.yml
+          2) bacpypes_yaml: {} in mappings.yaml
+          3) Fallback: bacpypes.options/args + device-Felder
+        """
+        # 1) eigene bacpypes.yml?
+        if os.path.exists(DEFAULT_BACPY_YAML_PATH):
+            parser = YAMLArgumentParser()
+            return parser.parse_args(["--yaml", DEFAULT_BACPY_YAML_PATH])
+
+        # 2) eingebetteter Block in mappings.yaml?
+        bp_yaml = self.cfg_all.get("bacpypes_yaml")
+        if isinstance(bp_yaml, dict):
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yml") as tf:
+                yaml.safe_dump(bp_yaml, tf)
+                temp_path = tf.name
+            parser = YAMLArgumentParser()
+            args = parser.parse_args(["--yaml", temp_path])
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            return args
+
+        # 3) Fallback: argv bauen
+        argv = _build_argv_from_yaml(self.cfg_all)
+        parser = SimpleArgumentParser()
+        return parser.parse_args(argv)
 
     async def _add_object(self, app, m: Mapping, AV, BV):
         key = (m.object_type, m.instance)
@@ -340,7 +372,20 @@ class Server:
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
-                        await self._write_to_ha(m, value)
+                        raw = value
+                        try:
+                            if hasattr(raw, "get_value"):
+                                raw = raw.get_value()
+                            elif hasattr(raw, "value"):
+                                raw = raw.value
+                            num = float(raw)
+                        except Exception:
+                            LOG.info("AV Write %s:%s -> unparsable %r (fallback 0.0)",
+                                     m.object_type, m.instance, value)
+                            num = 0.0
+                        LOG.info("AV Write %s:%s -> %s (prio=%s) -> HA",
+                                 m.object_type, m.instance, num, priority)
+                        await self._write_to_ha(m, num)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
 
@@ -361,49 +406,108 @@ class Server:
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
-                        await self._write_to_ha(m, value)
+                        raw = value
+                        try:
+                            if hasattr(raw, "get_value"):
+                                raw = raw.get_value()
+                            elif hasattr(raw, "value"):
+                                raw = raw.value
+                        except Exception:
+                            pass
+
+                        # Boolean / Zahl / String / Enum robust interpretieren
+                        on = False
+                        s = str(raw).lower()
+                        if s in ("1","true","on","active","open"):
+                            on = True
+                        elif s in ("0","false","off","inactive","closed"):
+                            on = False
+                        elif "active" in s:  # z.B. "BinaryPV.active"
+                            on = True
+
+                        LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
+                                 m.object_type, m.instance, on, priority)
+                        await self._write_to_ha(m, on)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
-        self.entity_index[m.entity_id] = obj  # <— für Live-Updates merken
+        self.entity_index[m.entity_id] = obj  # für Live-Updates merken
         LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _write_to_ha(self, m: Mapping, value):
-        svc = (m.write or {}).get("service")
-        if not (m.writable and svc):
+        """
+        Führt den in m.write.service angegebenen HA-Service aus.
+        Unterstützt:
+          - "<domain>.turn_on_off"  -> automatisch on/off
+          - "<domain>.<service>"    -> generisch + optional payload_key / extra
+        """
+        if not (m.writable and m.write and m.write.get("service")):
+            LOG.debug("Write ignored (kein Service definiert) für %s", m.entity_id)
             return
+
+        svc = m.write["service"]
+
+        # Kurzform: turn_on_off (light/switch etc.)
         if svc.endswith(".turn_on_off"):
-            domain = svc.split(".",1)[0]
-            name = "turn_on" if str(value).lower() in ("1","true","on","active") else "turn_off"
-            await self.ha.call_service(domain, name, {"entity_id": m.entity_id})
-            return
-        if "." in svc:
-            domain, service = svc.split(".",1)
+            domain = svc.split(".", 1)[0]
+            name = "turn_on" if bool(value) else "turn_off"
             data = {"entity_id": m.entity_id}
-            payload_key = (m.write or {}).get("payload_key")
-            if payload_key:
+            LOG.info("Call service %s.%s data=%s", domain, name, data)
+            await self.ha.call_service(domain, name, data)
+            return
+
+        # generischer Service
+        if "." in svc:
+            domain, service = svc.split(".", 1)
+            data = {"entity_id": m.entity_id}
+
+            payload_key = m.write.get("payload_key")
+            if payload_key is not None:
                 data[payload_key] = value
+
+            extra = m.write.get("extra")
+            if isinstance(extra, dict):
+                data.update(extra)
+
+            LOG.info("Call service %s.%s data=%s", domain, service, data)
             await self.ha.call_service(domain, service, data)
+            return
+
+        LOG.debug("Unbekanntes Serviceformat: %s", svc)
+
+    async def _initial_sync(self):
+        """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben."""
+        for m in self.mappings:
+            obj = self.entity_index.get(m.entity_id)
+            if not obj:
+                continue
+            if m.object_type == "analogValue":
+                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                try:
+                    obj.presentValue = float(val or 0.0)  # type: ignore
+                except Exception:
+                    obj.presentValue = 0.0  # type: ignore
+                LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
+            else:
+                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                obj.presentValue = bool(val)  # type: ignore
+                LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
     async def start(self):
-        # 1) YAML laden → argv für BACpypes bauen
-        cfg = self.load_config()
-        argv = _build_argv_from_yaml(cfg)
+        # 1) YAML laden
+        self.load_config()
 
         # 2) HA verbinden
         self.ha = HAWS()
         await self.ha.connect()
         await self.ha.prime_states()
-        await self.ha.subscribe_state_changes(self._on_state_changed)
 
-        # 3) BACpypes importieren
-        Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
+        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
-        # 4) Parser + Application.from_args (wie in deinem funktionierenden Beispiel)
-        parser = SimpleArgumentParser()
-        args = parser.parse_args(argv)  # nur YAML-argv
-
+        # 4) Application starten (wie in deinem funktionierenden Beispiel)
         app = Application.from_args(args)
         self.app = app
 
@@ -416,7 +520,7 @@ class Server:
                     break
         self.device = dev
 
-        # Logs wie erwartet
+        # Logs
         if _debug:
             try:
                 from bacpypes3.settings import settings as bp_settings
@@ -427,7 +531,7 @@ class Server:
 
         bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
-        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg["device_id"])
+        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
         if self.device:
             LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
@@ -438,6 +542,12 @@ class Server:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
             await self._add_object(self.app, m, AV, BV)
+
+        # 6) **Initiale Synchronisierung**
+        await self._initial_sync()
+
+        # 7) Live-Events abonnieren
+        await self.ha.subscribe_state_changes(self._on_state_changed)
 
     async def _on_state_changed(self, data: Dict[str, Any]):
         """Live-Update der presentValue bei HA-Änderungen."""
@@ -474,7 +584,7 @@ class Server:
                 obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
 
             LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
-            # Hinweis: COV-Notifications könnten hier optional gesendet werden.
+            # (optional) COV-Notifications könnten hier gesendet werden.
         except Exception as exc:
             LOG.debug("state_changed handling failed: %s", exc)
 
