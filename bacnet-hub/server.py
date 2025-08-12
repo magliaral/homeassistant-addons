@@ -9,19 +9,8 @@ import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-
-# --- bacpypes3 debugging import mit Fallback (MUSS vor erster Nutzung stehen!) ---
-try:
-    from bacpypes3.debugging import bacpypes_debugging, enable_debug  # type: ignore
-except Exception:
-    # Fallbacks: wenn bacpypes3 (noch) nicht importierbar ist
-    def bacpypes_debugging(cls):  # no-op decorator
-        return cls
-    def enable_debug(*args, **kwargs):
-        return
-
 # -----------------------------------------------------------
-# Logging-Grundkonfiguration
+# Grund-Logging (Addon)
 # -----------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +19,7 @@ logging.basicConfig(
 LOG = logging.getLogger("bacnet_hub_addon")
 
 # -----------------------------------------------------------
-# Add-on Optionen lesen
+# Add-on-Optionen lesen
 # -----------------------------------------------------------
 def load_addon_options() -> Dict[str, Any]:
     try:
@@ -43,35 +32,34 @@ OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
-level_name = (OPTS.get("bacpypes_log_level") or "info").lower()
-level_map = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR}
-logging.getLogger("bacpypes3").setLevel(level_map.get(level_name, logging.INFO))
+
+# -----------------------------------------------------------
+# bacpypes3 Debug: Decorator + ModuleLogger import (mit Fallback)
+# -----------------------------------------------------------
 try:
-    enable_debug()  # aktiviert @bacpypes_debugging-Output
-except Exception as exc:
-    LOG.warning("enable_debug() failed: %s", exc)
+    from bacpypes3.debugging import bacpypes_debugging, ModuleLogger  # type: ignore
+except Exception:
+    def bacpypes_debugging(cls):  # no-op, falls Paket fehlt
+        return cls
+    class ModuleLogger:  # minimaler Fallback
+        def __init__(self, _): pass
+        def __getattr__(self, _): return lambda *a, **k: None
 
-# -----------------------------------------------------------
-# bacpypes3 Debug aktivieren
-# -----------------------------------------------------------
+# globales Debug-Flag + Modul-Logger wie im Beispiel
+_debug = 1 if BACPYPES_LOG_LEVEL == "debug" else 0
+_log = ModuleLogger(globals())
+
+# bacpypes3-Logger auf gewünschtes Level setzen
 def configure_bacpypes_debug(level_name: str):
-    """
-    Setzt das Log-Level für alle bacpypes3-Logger und aktiviert den
-    bacpypes-internen Debug-Decorator-Output.
-    """
-    from bacpypes3.debugging import enable_debug
-
     level_map = {
         "debug": logging.DEBUG,
         "info": logging.INFO,
         "warning": logging.WARNING,
         "error": logging.ERROR,
     }
-    level = level_map.get(level_name, logging.INFO)
+    level = level_map.get((level_name or "info").lower(), logging.INFO)
 
-    # Python-Logger-Level für bacpypes3 anheben
     logging.getLogger("bacpypes3").setLevel(level)
-    # Einige nützliche Submodule optional direkter setzen
     for name in (
         "bacpypes3.app",
         "bacpypes3.comm",
@@ -83,46 +71,24 @@ def configure_bacpypes_debug(level_name: str):
     ):
         logging.getLogger(name).setLevel(level)
 
-    # Den bacpypes-eigenen Debug-Mechanismus aktivieren
-    # (ohne Modulnamen => alle @bacpypes_debugging-Klassen loggen)
-    try:
-        enable_debug()
-    except Exception as exc:
-        LOG.warning("enable_debug() failed: %s", exc)
+    LOG.info("bacpypes3 logger level set to '%s'", level_name)
 
-    LOG.info("bacpypes3 debug level set to '%s'", level_name)
-
-# Debug jetzt konfigurieren (so früh wie möglich)
-try:
-    configure_bacpypes_debug(BACPYPES_LOG_LEVEL)
-except Exception as exc:
-    LOG.warning("Could not configure bacpypes3 debug: %s", exc)
-
-# Dekorator erst nach Debug-Setup importieren (erzeugt schönere Logs)
-try:
-    from bacpypes3.debugging import bacpypes_debugging
-except Exception:
-    # Fallback, falls bacpypes3 noch nicht installiert wäre (sollte im Add-on aber sein)
-    def bacpypes_debugging(cls):
-        return cls
-
+configure_bacpypes_debug(BACPYPES_LOG_LEVEL)
 
 # -----------------------------------------------------------
-# Kleinere Hilfsfunktion
+# kleine Helfer
 # -----------------------------------------------------------
 async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
     return x
 
-
 # -----------------------------------------------------------
-# Home Assistant WebSocket-Client (nur WS, kein REST)
+# Home Assistant WebSocket Client
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
         self.url = HA_URL
-        # Token-Reihenfolge: Supervisor/Env -> Add-on-Option (LLAT)
         self.token = (
             os.getenv("SUPERVISOR_TOKEN")
             or os.getenv("HASSIO_TOKEN")
@@ -141,10 +107,8 @@ class HAWS:
 
     async def connect(self):
         import websockets
-
         self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
 
-        # Auth-Handshake der HA WebSocket API
         first = json.loads(await self.ws.recv())
         if first.get("type") == "auth_required":
             await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
@@ -211,9 +175,8 @@ class HAWS:
         if not res.get("success", True):
             LOG.warning("Service call failed: %s", res)
 
-
 # -----------------------------------------------------------
-# Mapping der Objekte
+# Mapping
 # -----------------------------------------------------------
 @dataclass
 class Mapping:
@@ -229,11 +192,10 @@ class Mapping:
 
     @property
     def is_analog(self) -> bool:
-        return self.object_type in ("analogValue", "analogInput", "analogOutput")
-
+        return self.object_type in ("analogValue","analogInput","analogOutput")
 
 # -----------------------------------------------------------
-# bacpypes3: Lazy-Import und App-Definition mit Debugging
+# bacpypes3 lazy-import
 # -----------------------------------------------------------
 def import_bacpypes():
     from importlib import import_module
@@ -254,10 +216,8 @@ def import_bacpypes():
     ]:
         try:
             m = import_module(mod)
-            if av and hasattr(m, av):
-                AV = getattr(m, av)
-            if bv and hasattr(m, bv):
-                BV = getattr(m, bv)
+            if av and hasattr(m, av): AV = getattr(m, av)
+            if bv and hasattr(m, bv): BV = getattr(m, bv)
         except Exception:
             pass
     if not AV or not BV:
@@ -265,10 +225,8 @@ def import_bacpypes():
 
     return _Application, _DeviceObject, AV, BV, _Unsigned, _Address, _IAm
 
-
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
-SUPPORTED_TYPES = {"analogValue", "binaryValue"}
-
+SUPPORTED_TYPES = {"analogValue","binaryValue"}
 
 # -----------------------------------------------------------
 # BACnet Server
@@ -285,20 +243,11 @@ class Server:
         self.objects: Dict[tuple, Mapping] = {}
 
     def load_config(self):
-        # Falls Datei fehlt, initiale Datei erzeugen
         if not os.path.exists(self.cfg_path):
             os.makedirs(os.path.dirname(self.cfg_path), exist_ok=True)
             with open(self.cfg_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(
-                    {
-                        "device": {
-                            "device_id": 500000,
-                            "name": "BACnet Hub",
-                            "address": "0.0.0.0",
-                            "port": 47808,
-                        },
-                        "objects": [],
-                    },
+                    {"device": {"device_id": 500000, "name": "BACnet Hub", "address": "0.0.0.0", "port": 47808}, "objects": []},
                     f,
                     sort_keys=False,
                 )
@@ -309,7 +258,7 @@ class Server:
         self.cfg = {
             "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
-            "address": dev.get("address", "0.0.0.0"),
+            "address": dev.get("address","0.0.0.0"),
             "port": int(dev.get("port", 47808)),
             "bbmd_ip": dev.get("bbmd_ip"),
             "bbmd_ttl": int(dev.get("bbmd_ttl", 600)) if dev.get("bbmd_ttl") else None,
@@ -322,11 +271,7 @@ class Server:
         name = m.name or m.entity_id
 
         if m.object_type == "analogValue":
-            obj = AnalogValueObject(
-                objectIdentifier=key,
-                objectName=name,
-                presentValue=0.0,
-            )
+            obj = AnalogValueObject(objectIdentifier=key, objectName=name, presentValue=0.0)
             if m.units and hasattr(obj, "units"):
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
@@ -334,7 +279,6 @@ class Server:
 
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
-
                 async def dyn_read(prop, arrayIndex=None):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue":
@@ -344,47 +288,36 @@ class Server:
                         except Exception:
                             obj.presentValue = 0.0  # type: ignore
                     return await maybe_await(orig(prop, arrayIndex))
-
                 obj.ReadProperty = dyn_read  # type: ignore
 
             if hasattr(obj, "WriteProperty") and m.writable:
                 origw = obj.WriteProperty
-
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue":
                         await Server._write_to_ha(ha, m, value)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-
                 obj.WriteProperty = dyn_write  # type: ignore
 
         else:  # binaryValue
-            obj = BinaryValueObject(
-                objectIdentifier=key,
-                objectName=name,
-                presentValue=False,
-            )
+            obj = BinaryValueObject(objectIdentifier=key, objectName=name, presentValue=False)
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
-
                 async def dyn_read(prop, arrayIndex=None):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue":
                         val = ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
                         obj.presentValue = bool(val)  # type: ignore
                     return await maybe_await(orig(prop, arrayIndex))
-
                 obj.ReadProperty = dyn_read  # type: ignore
 
             if hasattr(obj, "WriteProperty") and m.writable:
                 origw = obj.WriteProperty
-
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue":
                         await Server._write_to_ha(ha, m, value)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
@@ -396,12 +329,12 @@ class Server:
             return
         svc = m.write.get("service")
         if svc and svc.endswith(".turn_on_off"):
-            domain = svc.split(".", 1)[0]  # light/switch
-            name = "turn_on" if str(value).lower() in ("1", "true", "on", "active") else "turn_off"
+            domain = svc.split(".",1)[0]
+            name = "turn_on" if str(value).lower() in ("1","true","on","active") else "turn_off"
             await ha.call_service(domain, name, {"entity_id": m.entity_id})
             return
         if svc and "." in svc:
-            domain, service = svc.split(".", 1)
+            domain, service = svc.split(".",1)
             data = {"entity_id": m.entity_id}
             payload_key = m.write.get("payload_key")
             if payload_key:
@@ -422,14 +355,16 @@ class Server:
         self.bp = await asyncio.get_event_loop().run_in_executor(None, import_bacpypes)
         Application, DeviceObject, AnalogValueObject, BinaryValueObject, Unsigned, Address, IAmRequest = self.bp
 
-        # 4) App-Klasse *mit* Debug-Dekorator
+        # 4) App-Klasse mit bacpypes_debugging
         @bacpypes_debugging
         class _HAApp(Application):  # type: ignore
             def __init__(_self, device, addr, dev_id):
+                if _debug: _log.debug("__init__ device=%r addr=%r dev_id=%r", device, addr, dev_id)
                 super().__init__(device, addr)
                 _self._dev_id = dev_id
 
             async def do_WhoIsRequest(_self, apdu):
+                if _debug: _log.debug("do_WhoIsRequest %r", apdu)
                 try:
                     low = getattr(apdu, "deviceInstanceRangeLowLimit", None)
                     high = getattr(apdu, "deviceInstanceRangeHighLimit", None)
@@ -449,7 +384,7 @@ class Server:
                 except Exception as exc:
                     LOG.warning("do_WhoIsRequest failed: %s", exc)
 
-        # 5) Device + App binden
+        # 5) Device + App
         self.device = DeviceObject(
             objectIdentifier=("device", self.cfg["device_id"]),
             objectName=self.cfg["name"],
@@ -460,7 +395,7 @@ class Server:
         self.app = _HAApp(self.device, Address(bind), self.cfg["device_id"])
         LOG.info("BACnet bound to %s device-id=%s", bind, self.cfg["device_id"])
 
-        # 6) Optional BBMD
+        # 6) BBMD optional
         if self.cfg.get("bbmd_ip"):
             reg = getattr(self.app, "register_bbmd", None)
             if reg:
@@ -473,21 +408,20 @@ class Server:
         # 7) Objekte anlegen
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
-                LOG.warning("Unsupported type %s", m.object_type)
-                continue
+                LOG.warning("Unsupported type %s", m.object_type); continue
             key = await self._add_object(self.app, m, AnalogValueObject, BinaryValueObject, self.ha)
             self.objects[key] = m
             LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _on_state_changed(self, event):
-        # Platzhalter: On-Demand lesen reicht; COV wäre ein späteres Feature
+        # Platzhalter für COV – derzeit on-demand via ReadProperty
         return
 
     async def run_forever(self):
         await self.start()
-        stopper = asyncio.Event()
+        stop = asyncio.Event()
         try:
-            await stopper.wait()
+            await stop.wait()
         finally:
             if self.app:
                 close = getattr(self.app, "close", None)
@@ -495,7 +429,6 @@ class Server:
                     res = close()
                     if inspect.isawaitable(res):
                         await res
-
 
 # -----------------------------------------------------------
 # Main
