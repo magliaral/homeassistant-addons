@@ -1,3 +1,5 @@
 bacpypes3==0.0.102
 PyYAML
 websockets>=11
+fastapi
+uvicorn[standard]
