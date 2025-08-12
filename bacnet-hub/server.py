@@ -252,7 +252,7 @@ SUPPORTED_TYPES = {"analogValue","binaryValue"}
 # BACnet Server
 # -----------------------------------------------------------
 class Server:
-    def __init__(self, cfg_path="/config/bacnet_hub/mappings.yaml"):
+    def __init__(self, cfg_path="/config/bacnet-hub/mappings.yaml"):
         self.cfg_path = cfg_path
         self.cfg: Dict[str, Any] = {}
         self.mappings: List[Mapping] = []
