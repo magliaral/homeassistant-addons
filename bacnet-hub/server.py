@@ -96,7 +96,7 @@ def dump_obj_debug(prefix: str, obj) -> None:
 # -----------------------------------------------------------
 # YAML laden und argv für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -297,7 +297,7 @@ class Server:
         self.app = None
         self.device = None
 
-        # NEU: entity_id -> bacpypes Objekt (für schnelle Updates)
+        # entity_id -> bacpypes Objekt (für schnelle Updates)
         self.entity_index: Dict[str, Any] = {}
 
     def load_config(self) -> Dict[str, Any]:
@@ -340,7 +340,19 @@ class Server:
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
-                        await self._write_to_ha(m, value)
+                        raw = value
+                        try:
+                            if hasattr(raw, "get_value"):
+                                raw = raw.get_value()
+                            elif hasattr(raw, "value"):
+                                raw = raw.value
+                            num = float(raw)
+                        except Exception:
+                            LOG.debug("analogValue WriteProperty: unverstandener Wert %r", value)
+                            num = 0.0
+                        LOG.debug("WriteProperty AV %s:%s -> %s (prio=%s)",
+                                  m.object_type, m.instance, num, priority)
+                        await self._write_to_ha(m, num)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
 
@@ -361,30 +373,64 @@ class Server:
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
-                        await self._write_to_ha(m, value)
+                        raw = value
+                        try:
+                            if hasattr(raw, "get_value"):
+                                raw = raw.get_value()
+                            elif hasattr(raw, "value"):
+                                raw = raw.value
+                        except Exception:
+                            pass
+                        on = str(raw).lower() in ("1","true","on","active","open")
+                        LOG.debug("WriteProperty BV %s:%s -> %s (prio=%s)",
+                                  m.object_type, m.instance, on, priority)
+                        await self._write_to_ha(m, on)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
-        self.entity_index[m.entity_id] = obj  # <— für Live-Updates merken
+        self.entity_index[m.entity_id] = obj  # für Live-Updates merken
         LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _write_to_ha(self, m: Mapping, value):
-        svc = (m.write or {}).get("service")
-        if not (m.writable and svc):
+        """
+        Führt den in m.write.service angegebenen HA-Service aus.
+        Unterstützt:
+          - "<domain>.turn_on_off"  -> automatisch on/off
+          - "<domain>.<service>"    -> generisch + optional payload_key / extra
+        """
+        if not (m.writable and m.write and m.write.get("service")):
+            LOG.debug("Write ignored (kein Service definiert) für %s", m.entity_id)
             return
+
+        svc = m.write["service"]
+
+        # Kurzform: turn_on_off
         if svc.endswith(".turn_on_off"):
-            domain = svc.split(".",1)[0]
-            name = "turn_on" if str(value).lower() in ("1","true","on","active") else "turn_off"
+            domain = svc.split(".", 1)[0]
+            name = "turn_on" if bool(value) else "turn_off"
+            LOG.debug("Call service %s.%s entity_id=%s", domain, name, m.entity_id)
             await self.ha.call_service(domain, name, {"entity_id": m.entity_id})
             return
+
+        # generischer Service
         if "." in svc:
-            domain, service = svc.split(".",1)
+            domain, service = svc.split(".", 1)
             data = {"entity_id": m.entity_id}
-            payload_key = (m.write or {}).get("payload_key")
-            if payload_key:
+
+            payload_key = m.write.get("payload_key")
+            if payload_key is not None:
                 data[payload_key] = value
+
+            extra = m.write.get("extra")
+            if isinstance(extra, dict):
+                data.update(extra)
+
+            LOG.debug("Call service %s.%s data=%s", domain, service, data)
             await self.ha.call_service(domain, service, data)
+            return
+
+        LOG.debug("Unbekanntes Serviceformat: %s", svc)
 
     async def start(self):
         # 1) YAML laden → argv für BACpypes bauen
@@ -400,7 +446,7 @@ class Server:
         # 3) BACpypes importieren
         Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
 
-        # 4) Parser + Application.from_args (wie in deinem funktionierenden Beispiel)
+        # 4) Parser + Application.from_args (wie im funktionierenden Beispiel)
         parser = SimpleArgumentParser()
         args = parser.parse_args(argv)  # nur YAML-argv
 
@@ -474,7 +520,7 @@ class Server:
                 obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
 
             LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
-            # Hinweis: COV-Notifications könnten hier optional gesendet werden.
+            # (optional) COV-Notifications könnten hier gesendet werden.
         except Exception as exc:
             LOG.debug("state_changed handling failed: %s", exc)
 
