@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import inspect
+import io
 import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -31,14 +32,7 @@ def load_addon_options() -> Dict[str, Any]:
 OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
-BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "debug").lower()
-
-if BACPYPES_LOG_LEVEL == "debug":
-    # Root-Logger & Modul-Logger auf DEBUG
-    logging.getLogger().setLevel(logging.DEBUG)
-    logging.getLogger("__main__").setLevel(logging.DEBUG)
-    logging.getLogger(__name__).setLevel(logging.DEBUG)
-    LOG.setLevel(logging.DEBUG)
+BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
 
 # -----------------------------------------------------------
 # bacpypes3 Debug: Decorator + ModuleLogger import (mit Fallback)
@@ -64,7 +58,14 @@ def configure_bacpypes_debug(level_name: str):
         "warning": logging.WARNING,
         "error": logging.ERROR,
     }
-    level = level_map.get((level_name or "debug").lower(), logging.INFO)
+    level = level_map.get((level_name or "info").lower(), logging.INFO)
+
+    # Root/Modul-Logger bei Debug hochziehen, damit ModuleLogger-Ausgaben sichtbar werden
+    if level == logging.DEBUG:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("__main__").setLevel(logging.DEBUG)
+        logging.getLogger(__name__).setLevel(logging.DEBUG)
+        LOG.setLevel(logging.DEBUG)
 
     logging.getLogger("bacpypes3").setLevel(level)
     for name in (
@@ -89,6 +90,18 @@ async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
     return x
+
+def dump_obj_debug(prefix: str, obj) -> None:
+    """Loggt .debug_contents() eines BACpypes-Objekts, falls vorhanden."""
+    try:
+        buf = io.StringIO()
+        if hasattr(obj, "debug_contents"):
+            obj.debug_contents(file=buf)  # type: ignore[attr-defined]
+            LOG.debug("%s\n%s", prefix, buf.getvalue().rstrip())
+        else:
+            LOG.debug("%s %r (no debug_contents)", prefix, obj)
+    except Exception as exc:
+        LOG.debug("%s dump failed: %s", prefix, exc)
 
 # -----------------------------------------------------------
 # Home Assistant WebSocket Client
@@ -401,6 +414,23 @@ class Server:
         bind = f'{self.cfg["address"]}:{self.cfg["port"]}'
         self.app = _HAApp(self.device, Address(bind), self.cfg["device_id"])
         LOG.info("BACnet bound to %s device-id=%s", bind, self.cfg["device_id"])
+
+        # 5b) Zusatz-Startup-Dumps (wie von dir erwartet)
+        if BACPYPES_LOG_LEVEL == "debug":
+            LOG.debug("args: %s", {"address": bind})
+            LOG.debug("settings: %s", {
+                "debug": ["__main__"],
+                "color": False,
+                "debug_file": "",
+                "max_bytes": 1048576,
+                "backup_count": 5,
+                "route_aware": False,
+                "cov_lifetime": 60,
+            })
+            LOG.debug("ipv4_address: %r", Address(bind))
+            LOG.debug("local_device: %r", self.device)
+            dump_obj_debug("local_device contents:", self.device)
+            LOG.debug("app: %r", self.app)
 
         # 6) BBMD optional
         if self.cfg.get("bbmd_ip"):
