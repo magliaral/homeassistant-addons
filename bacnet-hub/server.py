@@ -6,7 +6,6 @@ import io
 import json
 import logging
 import os
-import tempfile
 import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -21,7 +20,7 @@ logging.basicConfig(
 LOG = logging.getLogger("bacnet_hub_addon")
 
 # -----------------------------------------------------------
-# Add-on-Optionen
+# Add-on Optionen
 # -----------------------------------------------------------
 def load_addon_options() -> Dict[str, Any]:
     try:
@@ -34,7 +33,6 @@ OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
-LOG_APDU = bool(OPTS.get("log_apdu", False))
 
 # -----------------------------------------------------------
 # bacpypes3 Debugging (ModuleLogger + Decorator)
@@ -58,6 +56,7 @@ def configure_bacpypes_debug(level_name: str):
     }
     level = level_map.get((level_name or "info").lower(), logging.INFO)
 
+    # damit ModuleLogger-Ausgaben sichtbar werden
     if level == logging.DEBUG:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("__main__").setLevel(logging.DEBUG)
@@ -94,39 +93,23 @@ def dump_obj_debug(prefix: str, obj) -> None:
     except Exception as exc:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
-def _pid_is_present_value(prop) -> bool:
-    """Erkenne 'present-value' robust (Enum/String/camel/underscore/hyphen)."""
-    try:
-        pid = getattr(prop, "propertyIdentifier", prop)
-    except Exception:
-        pid = prop
-    text = None
-    for attr in ("name", "value"):
-        if hasattr(pid, attr):
-            v = getattr(pid, attr)
-            if isinstance(v, str):
-                text = v
-                break
-    if text is None:
-        text = str(pid)
-    norm = text.replace("-", "").replace("_", "").lower()
-    return norm == "presentvalue"
-
 # -----------------------------------------------------------
-# YAML laden und argv/Parser für BACpypes bauen
+# YAML laden und argv für BACpypes bauen (wie in deinem Beispiel)
 # -----------------------------------------------------------
-DEFAULT_CFG_DIR = "/config/bacnet-hub"
-DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
-DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
-def _load_yaml(path: str) -> Dict[str, Any]:
+def _load_yaml_config(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
+        _log.warning("Konfigurationsdatei nicht gefunden: %s", path)
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+            if _debug:
+                _log.debug("Geladene YAML: %r", data)
+            return data
     except Exception as err:
-        LOG.warning("Fehler beim Laden von YAML %s: %r", path, err)
+        _log.error("Fehler beim Laden von YAML %s: %r", path, err)
         return {}
 
 def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
@@ -153,20 +136,22 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     elif "options" in bac and isinstance(bac["options"], dict):
         argv.extend(_bacpypes_dict_to_argv(bac["options"]))
 
+    # device: (fallbacks → häufige Keys mappen)
     dev = config.get("device", {}) or {}
+    # falls nicht in bacpypes.options gesetzt, ergänzen:
     if "--device-instance" not in argv and "-i" not in argv and dev.get("device_id"):
         argv.extend(["--device-instance", str(int(dev["device_id"]))])
     if dev.get("address"):
         argv.extend(["--address", str(dev["address"])])
     if dev.get("port"):
-        argv.extend(["--port", str(int(dev.get("port")))])
+        argv.extend(["--port", str(int(dev["port"]))])
 
     if _debug:
-        LOG.debug("Finale argv aus YAML: %r", argv)
+        _log.debug("Finale argv aus YAML: %r", argv)
     return argv
 
 # -----------------------------------------------------------
-# Home Assistant WebSocket Client
+# HA WebSocket Client
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
@@ -271,33 +256,17 @@ ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
 SUPPORTED_TYPES = {"analogValue","binaryValue"}
 
 # -----------------------------------------------------------
-# BACpypes Imports (lazy) + robuste Typ-Fallbacks
+# BACpypes Imports (lazy)
 # -----------------------------------------------------------
 def import_bacpypes():
     from importlib import import_module
     _Application = import_module("bacpypes3.app").Application
     _SimpleArgumentParser = import_module("bacpypes3.argparse").SimpleArgumentParser
-    _YAMLArgumentParser = import_module("bacpypes3.argparse").YAMLArgumentParser
     _DeviceObject = import_module("bacpypes3.local.device").DeviceObject
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
 
-    # Preferred primitive types
-    _prim = import_module("bacpypes3.primitivedata")
-    RealPD = getattr(_prim, "Real", float)
-    BooleanPD = getattr(_prim, "Boolean", bool)
-
-    # Robust: Any kann je nach Version woanders liegen
-    AnyPD = getattr(_prim, "Any", None)
-    if AnyPD is None:
-        AnyPD = getattr(_prim, "_Any", None)
-    if AnyPD is None:
-        try:
-            _cons = import_module("bacpypes3.constructeddata")
-            AnyPD = getattr(_cons, "Any", None)
-        except Exception:
-            AnyPD = None
-
+    # Objektklassen robust finden
     AV = BV = None
     for mod, av, bv in [
         ("bacpypes3.local.object", "AnalogValueObject", "BinaryValueObject"),
@@ -315,189 +284,7 @@ def import_bacpypes():
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    # Optional: BinaryPV Enum für active/inactive
-    BinaryPV = None
-    try:
-        BinaryPV = import_module("bacpypes3.basetypes").BinaryPV
-    except Exception:
-        BinaryPV = None
-
-    # APDU Klassen für Logging
-    _apdu = import_module("bacpypes3.apdu")
-    WritePropertyRequest = getattr(_apdu, "WritePropertyRequest", None)
-    WritePropertyMultipleRequest = getattr(_apdu, "WritePropertyMultipleRequest", None)
-
-    # ReadProperty (für Type-Hint/Importtest – benötigt die App sowieso)
-    try:
-        ReadPropertyRequest = getattr(_apdu, "ReadPropertyRequest")
-        ReadPropertyACK = getattr(_apdu, "ReadPropertyACK")
-    except Exception:
-        ReadPropertyRequest = None
-        ReadPropertyACK = None
-
-    return (_Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject,
-            AV, BV, _Unsigned, _Address, BinaryPV, WritePropertyRequest, WritePropertyMultipleRequest,
-            AnyPD, RealPD, BooleanPD, ReadPropertyRequest, ReadPropertyACK)
-
-# -----------------------------------------------------------
-# Custom Local Objects (nur WriteProperty; Read macht die App)
-# -----------------------------------------------------------
-class CustomAnalogValueObject:
-    def __init__(self, base_cls, mapping: Mapping, server: "Server", AnyPD, RealPD):
-        class _AV(base_cls):  # type: ignore[misc]
-            async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
-                if _pid_is_present_value(prop) and server.ha and mapping.writable:
-                    raw = value
-                    try:
-                        # Any → Real entpacken (falls Any existiert)
-                        if AnyPD is not None and isinstance(raw, AnyPD):
-                            try:
-                                raw = raw.cast(RealPD).get_value()
-                            except Exception:
-                                raw = raw.get_value()
-                        if hasattr(raw, "get_value"):
-                            raw = raw.get_value()
-                        elif hasattr(raw, "value"):
-                            raw = raw.value
-                        num = float(raw)
-                    except Exception:
-                        LOG.info("AV Write %s:%s -> unparsable %r (fallback 0.0)",
-                                 mapping.object_type, mapping.instance, value)
-                        num = 0.0
-                    LOG.info("AV Write %s:%s -> %s (prio=%s) -> HA",
-                             mapping.object_type, mapping.instance, num, priority)
-                    await server._write_to_ha(mapping, num)
-                return await super().WriteProperty(prop, value, arrayIndex, priority, direct)  # type: ignore[misc]
-        self.cls = _AV
-
-class CustomBinaryValueObject:
-    def __init__(self, base_cls, mapping: Mapping, server: "Server", BinaryPV, AnyPD, BooleanPD):
-        class _BV(base_cls):  # type: ignore[misc]
-            async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
-                if _pid_is_present_value(prop) and server.ha and mapping.writable:
-                    raw = value
-                    try:
-                        # Any → BinaryPV/Boolean entpacken (falls Any existiert)
-                        if AnyPD is not None and isinstance(raw, AnyPD):
-                            if BinaryPV is not None:
-                                try:
-                                    raw = raw.cast(BinaryPV).get_value()
-                                except Exception:
-                                    pass
-                            if hasattr(raw, "get_value"):
-                                raw = raw.get_value()
-                            if AnyPD is not None and isinstance(raw, AnyPD):
-                                try:
-                                    raw = raw.cast(BooleanPD).get_value()
-                                except Exception:
-                                    raw = str(raw)
-                        elif hasattr(raw, "get_value"):
-                            raw = raw.get_value()
-                        elif hasattr(raw, "value"):
-                            raw = raw.value
-                    except Exception:
-                        pass
-
-                    on = False
-                    s = str(raw).lower()
-                    if s in ("1","true","on","active","open"):
-                        on = True
-                    elif s in ("0","false","off","inactive","closed"):
-                        on = False
-                    elif "active" in s:
-                        on = True
-                    if not on and BinaryPV is not None:
-                        try:
-                            if raw == getattr(BinaryPV, "active"):
-                                on = True
-                            elif raw == getattr(BinaryPV, "inactive"):
-                                on = False
-                        except Exception:
-                            pass
-
-                    LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
-                             mapping.object_type, mapping.instance, on, priority)
-                    await server._write_to_ha(mapping, on)
-                return await super().WriteProperty(prop, value, arrayIndex, priority, direct)  # type: ignore[misc]
-        self.cls = _BV
-
-# -----------------------------------------------------------
-# Custom Application: sauberes ReadProperty + APDU-Logging
-# -----------------------------------------------------------
-def make_custom_application(base_cls, WritePropertyRequest, WritePropertyMultipleRequest):
-    try:
-        from bacpypes3.apdu import ReadPropertyRequest, ReadPropertyACK  # type: ignore
-    except Exception:
-        ReadPropertyRequest = None
-        ReadPropertyACK = None
-
-    @bacpypes_debugging
-    class CustomApplication(base_cls):  # type: ignore[misc]
-        async def do_ReadPropertyRequest(self, apdu):  # type: ignore[override]
-            """
-            Vor dem normalen Handling den present-value aus HA aktualisieren,
-            sodass ReadProperty die frischen Werte liefert.
-            """
-            try:
-                srv: "Server" = getattr(self, "_server_ref", None)
-                if srv and apdu and getattr(apdu, "propertyIdentifier", None) is not None:
-                    pid = getattr(apdu, "propertyIdentifier", None)
-                    pid_text = None
-                    for attr in ("name", "value"):
-                        if hasattr(pid, attr) and isinstance(getattr(pid, attr), str):
-                            pid_text = getattr(pid, attr)
-                            break
-                    if pid_text is None:
-                        pid_text = str(pid)
-                    if pid_text.replace("-", "").replace("_", "").lower() == "presentvalue":
-                        obj_id = getattr(apdu, "objectIdentifier", None)
-                        if isinstance(obj_id, tuple) and len(obj_id) == 2:
-                            obj_type_str = str(obj_id[0])
-                            inst = int(obj_id[1])
-                            m = next((mm for mm in srv.mappings
-                                      if mm.object_type.lower() == obj_type_str.replace("-", "").lower()
-                                      and mm.instance == inst), None)
-                            if m:
-                                obj = srv.entity_index.get(m.entity_id)
-                                if obj:
-                                    if m.object_type == "analogValue":
-                                        val = srv.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
-                                        try:
-                                            obj.presentValue = float(val or 0.0)  # type: ignore[attr-defined]
-                                        except Exception:
-                                            obj.presentValue = 0.0  # type: ignore[attr-defined]
-                                    else:
-                                        val = srv.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                                        obj.presentValue = bool(val)  # type: ignore[attr-defined]
-                                    LOG.debug("RP refresh from HA -> %s:%s pv=%r",
-                                              m.object_type, m.instance, getattr(obj, "presentValue", None))
-            except Exception as exc:
-                LOG.debug("do_ReadPropertyRequest pre-refresh failed: %s", exc)
-
-            return await super().do_ReadPropertyRequest(apdu)  # type: ignore[misc]
-
-        async def do_WritePropertyRequest(self, apdu):  # type: ignore[override]
-            try:
-                obj = getattr(apdu, "objectIdentifier", None)
-                prop = getattr(apdu, "propertyIdentifier", None)
-                value = getattr(apdu, "propertyValue", None)
-                prio = getattr(apdu, "priority", None)
-                LOG.info("APDU WritePropertyRequest obj=%r prop=%r prio=%r value=%r", obj, prop, prio, value)
-                if LOG_APDU and hasattr(apdu, "debug_contents"):
-                    apdu.debug_contents()
-            except Exception:
-                LOG.info("APDU WritePropertyRequest (unable to format)")
-            return await super().do_WritePropertyRequest(apdu)  # type: ignore[misc]
-
-        async def do_WritePropertyMultipleRequest(self, apdu):  # type: ignore[override]
-            try:
-                LOG.info("APDU WritePropertyMultipleRequest recv")
-                if LOG_APDU and hasattr(apdu, "debug_contents"):
-                    apdu.debug_contents()
-            except Exception:
-                LOG.info("APDU WritePropertyMultipleRequest (unable to format)")
-            return await super().do_WritePropertyMultipleRequest(apdu)  # type: ignore[misc]
-    return CustomApplication
+    return _Application, _SimpleArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
 
 # -----------------------------------------------------------
 # Server
@@ -505,218 +292,152 @@ def make_custom_application(base_cls, WritePropertyRequest, WritePropertyMultipl
 class Server:
     def __init__(self, cfg_path: str = DEFAULT_CONFIG_PATH):
         self.cfg_path = cfg_path
-        self.cfg_all: Dict[str, Any] = {}
-        self.cfg_device: Dict[str, Any] = {}
+        self.cfg: Dict[str, Any] = {}
         self.mappings: List[Mapping] = []
 
         self.ha: Optional[HAWS] = None
         self.app = None
         self.device = None
 
-        # entity_id -> bacpypes Objekt
-        self.entity_index: Dict[str, Any] = {}
-
-    def load_config(self) -> None:
-        cfg = _load_yaml(self.cfg_path)
-        self.cfg_all = cfg
+    def load_config(self) -> Dict[str, Any]:
+        cfg = _load_yaml_config(self.cfg_path)
         dev = cfg.get("device", {}) or {}
         objs = cfg.get("objects", []) or []
-        self.cfg_device = {
+        self.cfg = {
             "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
+        return cfg
 
-    def build_bacpypes_args(self, YAMLArgumentParser, SimpleArgumentParser):
-        # 1) eigene bacpypes.yml?
-        if os.path.exists(DEFAULT_BACPY_YAML_PATH):
-            parser = YAMLArgumentParser()
-            return parser.parse_args(["--yaml", DEFAULT_BACPY_YAML_PATH])
-
-        # 2) eingebetteter Block in mappings.yaml?
-        bp_yaml = self.cfg_all.get("bacpypes_yaml")
-        if isinstance(bp_yaml, dict):
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yml") as tf:
-                yaml.safe_dump(bp_yaml, tf)
-                temp_path = tf.name
-            parser = YAMLArgumentParser()
-            args = parser.parse_args(["--yaml", temp_path])
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-            return args
-
-        # 3) Fallback: argv bauen
-        argv = _build_argv_from_yaml(self.cfg_all)
-        parser = SimpleArgumentParser()
-        return parser.parse_args(argv)
-
-    async def _add_object(self, app, m: Mapping, AV, BV, BinaryPV, AnyPD, RealPD, BooleanPD):
+    async def _add_object(self, app, m: Mapping, AV, BV):
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
         if m.object_type == "analogValue":
-            AVCls = CustomAnalogValueObject(AV, m, self, AnyPD, RealPD).cls
-            obj = AVCls(objectIdentifier=key, objectName=name, presentValue=0.0)
+            obj = AV(objectIdentifier=key, objectName=name, presentValue=0.0)
             if m.units and hasattr(obj, "units"):
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
-                    obj.units = units  # type: ignore[attr-defined]
-        else:
-            BVCls = CustomBinaryValueObject(BV, m, self, BinaryPV, AnyPD, BooleanPD).cls
-            obj = BVCls(objectIdentifier=key, objectName=name, presentValue=False)
+                    obj.units = units  # type: ignore
+
+            if hasattr(obj, "ReadProperty"):
+                orig = obj.ReadProperty
+                async def dyn_read(prop, arrayIndex=None):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                        try:
+                            obj.presentValue = float(val or 0.0)  # type: ignore
+                        except Exception:
+                            obj.presentValue = 0.0  # type: ignore
+                    return await maybe_await(orig(prop, arrayIndex))
+                obj.ReadProperty = dyn_read  # type: ignore
+
+            if hasattr(obj, "WriteProperty") and m.writable:
+                origw = obj.WriteProperty
+                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        await self._write_to_ha(m, value)
+                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
+                obj.WriteProperty = dyn_write  # type: ignore
+
+        else:  # binaryValue
+            obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
+            if hasattr(obj, "ReadProperty"):
+                orig = obj.ReadProperty
+                async def dyn_read(prop, arrayIndex=None):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                        obj.presentValue = bool(val)  # type: ignore
+                    return await maybe_await(orig(prop, arrayIndex))
+                obj.ReadProperty = dyn_read  # type: ignore
+
+            if hasattr(obj, "WriteProperty") and m.writable:
+                origw = obj.WriteProperty
+                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
+                    pid = getattr(prop, "propertyIdentifier", str(prop))
+                    if pid == "presentValue" and self.ha:
+                        await self._write_to_ha(m, value)
+                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
+                obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
-        self.entity_index[m.entity_id] = obj
         LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _write_to_ha(self, m: Mapping, value):
-        """
-        Führt den in m.write.service angegebenen HA-Service aus.
-        Unterstützt:
-          - "<domain>.turn_on_off"  -> automatisch on/off
-          - "<domain>.<service>"    -> generisch + optional payload_key / extra
-        """
-        if not (m.writable and m.write and m.write.get("service")):
-            LOG.warning("Write ignored (kein Service definiert) für %s", m.entity_id)
+        svc = (m.write or {}).get("service")
+        if not (m.writable and svc):
             return
-
-        svc = m.write["service"]
-
         if svc.endswith(".turn_on_off"):
-            domain = svc.split(".", 1)[0]
-            name = "turn_on" if bool(value) else "turn_off"
-            data = {"entity_id": m.entity_id}
-            LOG.info("Call service %s.%s data=%s", domain, name, data)
-            await self.ha.call_service(domain, name, data)
+            domain = svc.split(".",1)[0]
+            name = "turn_on" if str(value).lower() in ("1","true","on","active") else "turn_off"
+            await self.ha.call_service(domain, name, {"entity_id": m.entity_id})
             return
-
         if "." in svc:
-            domain, service = svc.split(".", 1)
+            domain, service = svc.split(".",1)
             data = {"entity_id": m.entity_id}
-            payload_key = m.write.get("payload_key")
-            if payload_key is not None:
+            payload_key = (m.write or {}).get("payload_key")
+            if payload_key:
                 data[payload_key] = value
-            extra = m.write.get("extra")
-            if isinstance(extra, dict):
-                data.update(extra)
-            LOG.info("Call service %s.%s data=%s", domain, service, data)
             await self.ha.call_service(domain, service, data)
-            return
-
-        LOG.warning("Unbekanntes Serviceformat: %s", svc)
-
-    async def _initial_sync(self):
-        """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben."""
-        for m in self.mappings:
-            obj = self.entity_index.get(m.entity_id)
-            if not obj:
-                continue
-            if m.object_type == "analogValue":
-                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
-                try:
-                    obj.presentValue = float(val or 0.0)  # type: ignore[attr-defined]
-                except Exception:
-                    obj.presentValue = 0.0  # type: ignore[attr-defined]
-                LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
-            else:
-                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                obj.presentValue = bool(val)  # type: ignore[attr-defined]
-                LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
     async def start(self):
-        # 1) YAML laden
-        self.load_config()
+        # 1) YAML laden → argv für BACpypes bauen
+        cfg = self.load_config()
+        argv = _build_argv_from_yaml(cfg)
 
         # 2) HA verbinden
         self.ha = HAWS()
         await self.ha.connect()
         await self.ha.prime_states()
+        await self.ha.subscribe_state_changes(self._on_state_changed)
 
-        # 3) BACpypes importieren & Parser/Args vorbereiten
-        (BaseApplication, SimpleArgumentParser, YAMLArgumentParser, DeviceObject,
-         AV, BV, Unsigned, Address, BinaryPV, WPR, WPMR,
-         AnyPD, RealPD, BooleanPD, RPR, RPACK) = import_bacpypes()
+        # 3) BACpypes importieren
+        Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
 
-        # 4) Custom Application-Klasse mit sauberem ReadProperty + Logging
-        CustomApplication = make_custom_application(BaseApplication, WPR, WPMR)
+        # 4) Parser wie im Beispiel + Application.from_args
+        parser = SimpleArgumentParser()
+        # (wir parsen **nur** argv aus YAML, nicht sys.argv)
+        args = parser.parse_args(argv)
 
-        args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
-
-        # 5) Application starten
-        app = CustomApplication.from_args(args)   # unsere Subklasse!
+        # App aus Args erstellen (dein funktionierendes Pattern)
+        app = Application.from_args(args)
         self.app = app
-        setattr(self.app, "_server_ref", self)    # <-- Server-Ref für do_ReadPropertyRequest
 
-        # Device referenzieren
+        # lokales Device holen (liegt in der Application)
+        # in neueren Versionen: app.local_device; ansonsten im objectIdentifier-Index
         dev = getattr(app, "local_device", None)
         if not dev:
+            # heuristik: erstes DeviceObject aus app.objectIdentifier
             for obj in app.objectIdentifier.values():
                 if isinstance(obj, DeviceObject):
                     dev = obj
                     break
         self.device = dev
 
-        # Logs
         if _debug:
-            try:
-                from bacpypes3.settings import settings as bp_settings
-                LOG.debug("args: %r", vars(args))
-                LOG.debug("settings: %s", dict(bp_settings))
-            except Exception:
-                LOG.debug("args: %r", vars(args))
-
+            LOG.debug("args: %r", vars(args))
+            LOG.debug("settings: %s", dict(getattr(__import__("bacpypes3.settings","*"), "settings", {})))
+        # Bind-Adresse aus Args extrahieren (nur fürs Log)
         bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
-        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
+        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg["device_id"])
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
         if self.device:
             LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
         LOG.debug("app: %r", self.app)
 
-        # 6) Objekte anlegen
+        # 5) Objekte anlegen
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
-            await self._add_object(self.app, m, AV, BV, BinaryPV, AnyPD, RealPD, BooleanPD)
+            await self._add_object(self.app, m, AV, BV)
 
-        # 7) Initiale Synchronisierung
-        await self._initial_sync()
-
-        # 8) Live-Events abonnieren
-        await self.ha.subscribe_state_changes(self._on_state_changed)
-
-    async def _on_state_changed(self, data: Dict[str, Any]):
-        """Live-Update der presentValue bei HA-Änderungen."""
-        try:
-            ent_id = data.get("entity_id")
-            if not ent_id:
-                return
-            obj = self.entity_index.get(ent_id)
-            if not obj:
-                return
-            m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
-            if not m:
-                return
-            new_state = data.get("new_state") or {}
-            if m.mode == "attr" and m.attr:
-                val = (new_state.get("attributes") or {}).get(m.attr)
-            else:
-                val = new_state.get("state")
-            if m.object_type == "analogValue":
-                try:
-                    if val in (None, "", "unknown", "unavailable"):
-                        obj.presentValue = 0.0  # type: ignore[attr-defined]
-                    else:
-                        obj.presentValue = float(val)  # type: ignore[attr-defined]
-                except Exception:
-                    obj.presentValue = 0.0  # type: ignore[attr-defined]
-            else:
-                obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore[attr-defined]
-            LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
-        except Exception as exc:
-            LOG.debug("state_changed handling failed: %s", exc)
+    async def _on_state_changed(self, event):
+        return  # (COV später)
 
     async def run_forever(self):
         await self.start()
