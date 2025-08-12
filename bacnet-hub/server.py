@@ -96,7 +96,7 @@ def dump_obj_debug(prefix: str, obj) -> None:
 # -----------------------------------------------------------
 # YAML laden und argv für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -348,10 +348,11 @@ class Server:
                                 raw = raw.value
                             num = float(raw)
                         except Exception:
-                            LOG.debug("analogValue WriteProperty: unverstandener Wert %r", value)
+                            LOG.info("AV Write %s:%s -> unparsable %r (fallback 0.0)",
+                                     m.object_type, m.instance, value)
                             num = 0.0
-                        LOG.debug("WriteProperty AV %s:%s -> %s (prio=%s)",
-                                  m.object_type, m.instance, num, priority)
+                        LOG.info("AV Write %s:%s -> %s (prio=%s) -> HA",
+                                 m.object_type, m.instance, num, priority)
                         await self._write_to_ha(m, num)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
@@ -370,37 +371,32 @@ class Server:
 
             if hasattr(obj, "WriteProperty") and m.writable:
                 origw = obj.WriteProperty
-            
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
                         raw = value
                         try:
-                            # BACpypes-Typen entpacken
                             if hasattr(raw, "get_value"):
                                 raw = raw.get_value()
                             elif hasattr(raw, "value"):
                                 raw = raw.value
                         except Exception:
                             pass
-            
-                        # Enum BinaryPV.active/inactive, Boolean, Zahl, String abdecken
+
+                        # Boolean / Zahl / String / Enum robust interpretieren
                         on = False
                         s = str(raw).lower()
                         if s in ("1","true","on","active","open"):
                             on = True
                         elif s in ("0","false","off","inactive","closed"):
                             on = False
-                        else:
-                            # manche Enums haben repr wie "BinaryPV.active"
-                            if "active" in s:
-                                on = True
-            
+                        elif "active" in s:  # z.B. "BinaryPV.active"
+                            on = True
+
                         LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
                                  m.object_type, m.instance, on, priority)
                         await self._write_to_ha(m, on)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-            
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
@@ -420,12 +416,13 @@ class Server:
 
         svc = m.write["service"]
 
-        # Kurzform: turn_on_off
+        # Kurzform: turn_on_off (light/switch etc.)
         if svc.endswith(".turn_on_off"):
             domain = svc.split(".", 1)[0]
             name = "turn_on" if bool(value) else "turn_off"
-            LOG.debug("Call service %s.%s entity_id=%s", domain, name, m.entity_id)
-            await self.ha.call_service(domain, name, {"entity_id": m.entity_id})
+            data = {"entity_id": m.entity_id}
+            LOG.info("Call service %s.%s data=%s", domain, name, data)
+            await self.ha.call_service(domain, name, data)
             return
 
         # generischer Service
@@ -441,7 +438,7 @@ class Server:
             if isinstance(extra, dict):
                 data.update(extra)
 
-            LOG.debug("Call service %s.%s data=%s", domain, service, data)
+            LOG.info("Call service %s.%s data=%s", domain, service, data)
             await self.ha.call_service(domain, service, data)
             return
 
