@@ -58,7 +58,7 @@ from bacpypes3.json.util import (
 )
 
 # Debugging
-_debug = 0
+_debug = 1
 _log = ModuleLogger(globals())
 
 # Globale Variablen
