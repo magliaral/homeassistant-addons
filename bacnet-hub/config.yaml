@@ -1,7 +1,7 @@
 name: BACnet Hub
 version: "0.1.0"
 slug: bacnet-hub
-description: Publiziert Home Assistant Entitäten als BACnet/IP-Objekte (WebSocket only)
+description: Enables seamless integration between Home Assistant and BACnet/IP.
 arch:
   - amd64
   - aarch64
