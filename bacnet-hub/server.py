@@ -9,6 +9,17 @@ import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+
+# --- bacpypes3 debugging import mit Fallback (MUSS vor erster Nutzung stehen!) ---
+try:
+    from bacpypes3.debugging import bacpypes_debugging, enable_debug  # type: ignore
+except Exception:
+    # Fallbacks: wenn bacpypes3 (noch) nicht importierbar ist
+    def bacpypes_debugging(cls):  # no-op decorator
+        return cls
+    def enable_debug(*args, **kwargs):
+        return
+
 # -----------------------------------------------------------
 # Logging-Grundkonfiguration
 # -----------------------------------------------------------
@@ -32,6 +43,13 @@ OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
+level_name = (OPTS.get("bacpypes_log_level") or "info").lower()
+level_map = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR}
+logging.getLogger("bacpypes3").setLevel(level_map.get(level_name, logging.INFO))
+try:
+    enable_debug()  # aktiviert @bacpypes_debugging-Output
+except Exception as exc:
+    LOG.warning("enable_debug() failed: %s", exc)
 
 # -----------------------------------------------------------
 # bacpypes3 Debug aktivieren
