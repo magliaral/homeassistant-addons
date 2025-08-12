@@ -57,7 +57,6 @@ def configure_bacpypes_debug(level_name: str):
     }
     level = level_map.get((level_name or "info").lower(), logging.INFO)
 
-    # ModuleLogger-Ausgaben sichtbar machen
     if level == logging.DEBUG:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("__main__").setLevel(logging.DEBUG)
@@ -95,25 +94,21 @@ def dump_obj_debug(prefix: str, obj) -> None:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
 def _pid_is_present_value(prop) -> bool:
-    """
-    Erkenne 'present-value' robust, egal ob Enum oder String:
-    'present-value', 'present_value', 'presentValue', PropertyIdentifier.present_value, etc.
-    """
+    """Erkenne 'present-value' robust (Enum/String/camel/underscore/hyphen)."""
     try:
         pid = getattr(prop, "propertyIdentifier", prop)
     except Exception:
         pid = prop
-    # Enum? Dann .name oder .value probieren
-    txt = None
+    text = None
     for attr in ("name", "value"):
         if hasattr(pid, attr):
             v = getattr(pid, attr)
             if isinstance(v, str):
-                txt = v
+                text = v
                 break
-    if txt is None:
-        txt = str(pid)
-    norm = txt.replace("-", "").replace("_", "").lower()
+    if text is None:
+        text = str(pid)
+    norm = text.replace("-", "").replace("_", "").lower()
     return norm == "presentvalue"
 
 # -----------------------------------------------------------
@@ -157,7 +152,6 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     elif "options" in bac and isinstance(bac["options"], dict):
         argv.extend(_bacpypes_dict_to_argv(bac["options"]))
 
-    # device fallbacks
     dev = config.get("device", {}) or {}
     if "--device-instance" not in argv and "-i" not in argv and dev.get("device_id"):
         argv.extend(["--device-instance", str(int(dev["device_id"]))])
@@ -269,7 +263,7 @@ class Mapping:
     writable: bool = False
     mode: str = "state"     # state | attr
     attr: Optional[str] = None
-    name: Optional[string] = None
+    name: Optional[str] = None
     write: Optional[Dict[str, Any]] = None
 
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
@@ -304,7 +298,7 @@ def import_bacpypes():
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    # Optional: BinaryPV Enum zum Erkennen von active/inactive
+    # Optional: BinaryPV Enum für active/inactive
     BinaryPV = None
     try:
         BinaryPV = import_module("bacpypes3.basetypes").BinaryPV
@@ -312,6 +306,84 @@ def import_bacpypes():
         BinaryPV = None
 
     return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address, BinaryPV
+
+# -----------------------------------------------------------
+# Custom Local Objects (saubere Overrides)
+# -----------------------------------------------------------
+class CustomAnalogValueObject:
+    def __init__(self, base_cls, mapping: Mapping, server: "Server"):
+        # dynamisch eine Subklasse erzeugen, die Read/Write überschreibt
+        class _AV(base_cls):  # type: ignore[misc]
+            async def ReadProperty(self, prop, arrayIndex=None):  # type: ignore[override]
+                if _pid_is_present_value(prop) and server.ha:
+                    val = server.ha.get_value(mapping.entity_id, mapping.mode, mapping.attr, analog=True)
+                    try:
+                        self.presentValue = float(val or 0.0)  # type: ignore[attr-defined]
+                    except Exception:
+                        self.presentValue = 0.0  # type: ignore[attr-defined]
+                return await super().ReadProperty(prop, arrayIndex)  # type: ignore[misc]
+
+            async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
+                if _pid_is_present_value(prop) and server.ha and mapping.writable:
+                    raw = value
+                    try:
+                        if hasattr(raw, "get_value"):
+                            raw = raw.get_value()
+                        elif hasattr(raw, "value"):
+                            raw = raw.value
+                        num = float(raw)
+                    except Exception:
+                        LOG.info("AV Write %s:%s -> unparsable %r (fallback 0.0)",
+                                 mapping.object_type, mapping.instance, value)
+                        num = 0.0
+                    LOG.info("AV Write %s:%s -> %s (prio=%s) -> HA",
+                             mapping.object_type, mapping.instance, num, priority)
+                    await server._write_to_ha(mapping, num)
+                return await super().WriteProperty(prop, value, arrayIndex, priority, direct)  # type: ignore[misc]
+        self.cls = _AV
+
+class CustomBinaryValueObject:
+    def __init__(self, base_cls, mapping: Mapping, server: "Server", BinaryPV):
+        class _BV(base_cls):  # type: ignore[misc]
+            async def ReadProperty(self, prop, arrayIndex=None):  # type: ignore[override]
+                if _pid_is_present_value(prop) and server.ha:
+                    val = server.ha.get_value(mapping.entity_id, mapping.mode, mapping.attr, analog=False)
+                    self.presentValue = bool(val)  # type: ignore[attr-defined]
+                return await super().ReadProperty(prop, arrayIndex)  # type: ignore[misc]
+
+            async def WriteProperty(self, prop, value, arrayIndex=None, priority=None, direct=False):  # type: ignore[override]
+                if _pid_is_present_value(prop) and server.ha and mapping.writable:
+                    raw = value
+                    try:
+                        if hasattr(raw, "get_value"):
+                            raw = raw.get_value()
+                        elif hasattr(raw, "value"):
+                            raw = raw.value
+                    except Exception:
+                        pass
+
+                    on = False
+                    s = str(raw).lower()
+                    if s in ("1","true","on","active","open"):
+                        on = True
+                    elif s in ("0","false","off","inactive","closed"):
+                        on = False
+                    elif "active" in s:
+                        on = True
+                    if not on and BinaryPV is not None:
+                        try:
+                            if raw == getattr(BinaryPV, "active"):
+                                on = True
+                            elif raw == getattr(BinaryPV, "inactive"):
+                                on = False
+                        except Exception:
+                            pass
+
+                    LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
+                             mapping.object_type, mapping.instance, on, priority)
+                    await server._write_to_ha(mapping, on)
+                return await super().WriteProperty(prop, value, arrayIndex, priority, direct)  # type: ignore[misc]
+        self.cls = _BV
 
 # -----------------------------------------------------------
 # Server
@@ -327,7 +399,7 @@ class Server:
         self.app = None
         self.device = None
 
-        # entity_id -> bacpypes Objekt (für schnelle Updates)
+        # entity_id -> bacpypes Objekt
         self.entity_index: Dict[str, Any] = {}
 
     def load_config(self) -> None:
@@ -342,12 +414,6 @@ class Server:
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
 
     def build_bacpypes_args(self, YAMLArgumentParser, SimpleArgumentParser):
-        """
-        Präferenz:
-          1) /config/bacnet_hub/bacpypes.yml
-          2) bacpypes_yaml: {} in mappings.yaml
-          3) Fallback: bacpypes.options/args + device-Felder
-        """
         # 1) eigene bacpypes.yml?
         if os.path.exists(DEFAULT_BACPY_YAML_PATH):
             parser = YAMLArgumentParser()
@@ -376,103 +442,16 @@ class Server:
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
-        # --- analogValue ---
         if m.object_type == "analogValue":
-            obj = AV(objectIdentifier=key, objectName=name, presentValue=0.0)
+            AVCls = CustomAnalogValueObject(AV, m, self).cls
+            obj = AVCls(objectIdentifier=key, objectName=name, presentValue=0.0)
             if m.units and hasattr(obj, "units"):
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
-                    obj.units = units  # type: ignore
-
-            # READ
-            if hasattr(obj, "ReadProperty"):
-                orig = obj.ReadProperty
-                async def dyn_read(prop, arrayIndex=None):
-                    if _pid_is_present_value(prop) and self.ha:
-                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
-                        try:
-                            obj.presentValue = float(val or 0.0)  # type: ignore
-                        except Exception:
-                            obj.presentValue = 0.0  # type: ignore
-                    return await maybe_await(orig(prop, arrayIndex))
-                obj.ReadProperty = dyn_read  # type: ignore
-
-            # WRITE
-            # Manche Klassen haben 'WriteProperty', manche 'write_property'
-            write_attr_name = "WriteProperty" if hasattr(obj, "WriteProperty") else ("write_property" if hasattr(obj, "write_property") else None)
-            if write_attr_name and m.writable:
-                origw = getattr(obj, write_attr_name)
-                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    if _pid_is_present_value(prop) and self.ha:
-                        raw = value
-                        try:
-                            if hasattr(raw, "get_value"):
-                                raw = raw.get_value()
-                            elif hasattr(raw, "value"):
-                                raw = raw.value
-                            num = float(raw)
-                        except Exception:
-                            LOG.info("AV Write %s:%s -> unparsable %r (fallback 0.0)",
-                                     m.object_type, m.instance, value)
-                            num = 0.0
-                        LOG.info("AV Write %s:%s -> %s (prio=%s) -> HA",
-                                 m.object_type, m.instance, num, priority)
-                        await self._write_to_ha(m, num)
-                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-                setattr(obj, write_attr_name, dyn_write)  # type: ignore
-
-        # --- binaryValue ---
+                    obj.units = units  # type: ignore[attr-defined]
         else:
-            obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
-
-            # READ
-            if hasattr(obj, "ReadProperty"):
-                orig = obj.ReadProperty
-                async def dyn_read(prop, arrayIndex=None):
-                    if _pid_is_present_value(prop) and self.ha:
-                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                        obj.presentValue = bool(val)  # type: ignore
-                    return await maybe_await(orig(prop, arrayIndex))
-                obj.ReadProperty = dyn_read  # type: ignore
-
-            # WRITE
-            write_attr_name = "WriteProperty" if hasattr(obj, "WriteProperty") else ("write_property" if hasattr(obj, "write_property") else None)
-            if write_attr_name and m.writable:
-                origw = getattr(obj, write_attr_name)
-                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    if _pid_is_present_value(prop) and self.ha:
-                        raw = value
-                        try:
-                            if hasattr(raw, "get_value"):
-                                raw = raw.get_value()
-                            elif hasattr(raw, "value"):
-                                raw = raw.value
-                        except Exception:
-                            pass
-
-                        on = False
-                        s = str(raw).lower()
-                        if s in ("1","true","on","active","open"):
-                            on = True
-                        elif s in ("0","false","off","inactive","closed"):
-                            on = False
-                        elif "active" in s:
-                            on = True
-                        # Enum BinaryPV?
-                        if not on and BinaryPV is not None:
-                            try:
-                                if raw == getattr(BinaryPV, "active"):
-                                    on = True
-                                elif raw == getattr(BinaryPV, "inactive"):
-                                    on = False
-                            except Exception:
-                                pass
-
-                        LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
-                                 m.object_type, m.instance, on, priority)
-                        await self._write_to_ha(m, on)
-                    return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-                setattr(obj, write_attr_name, dyn_write)  # type: ignore
+            BVCls = CustomBinaryValueObject(BV, m, self, BinaryPV).cls
+            obj = BVCls(objectIdentifier=key, objectName=name, presentValue=False)
 
         await maybe_await(app.add_object(obj))
         self.entity_index[m.entity_id] = obj
@@ -491,7 +470,6 @@ class Server:
 
         svc = m.write["service"]
 
-        # Kurzform: turn_on_off (light/switch etc.)
         if svc.endswith(".turn_on_off"):
             domain = svc.split(".", 1)[0]
             name = "turn_on" if bool(value) else "turn_off"
@@ -500,19 +478,15 @@ class Server:
             await self.ha.call_service(domain, name, data)
             return
 
-        # generischer Service
         if "." in svc:
             domain, service = svc.split(".", 1)
             data = {"entity_id": m.entity_id}
-
             payload_key = m.write.get("payload_key")
             if payload_key is not None:
                 data[payload_key] = value
-
             extra = m.write.get("extra")
             if isinstance(extra, dict):
                 data.update(extra)
-
             LOG.info("Call service %s.%s data=%s", domain, service, data)
             await self.ha.call_service(domain, service, data)
             return
@@ -528,13 +502,13 @@ class Server:
             if m.object_type == "analogValue":
                 val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
                 try:
-                    obj.presentValue = float(val or 0.0)  # type: ignore
+                    obj.presentValue = float(val or 0.0)  # type: ignore[attr-defined]
                 except Exception:
-                    obj.presentValue = 0.0  # type: ignore
+                    obj.presentValue = 0.0  # type: ignore[attr-defined]
                 LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
             else:
                 val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                obj.presentValue = bool(val)  # type: ignore
+                obj.presentValue = bool(val)  # type: ignore[attr-defined]
                 LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
     async def start(self):
@@ -586,7 +560,7 @@ class Server:
                 LOG.warning("Unsupported type %s", m.object_type); continue
             await self._add_object(self.app, m, AV, BV, BinaryPV)
 
-        # 6) **Initiale Synchronisierung**
+        # 6) Initiale Synchronisierung
         await self._initial_sync()
 
         # 7) Live-Events abonnieren
@@ -601,33 +575,25 @@ class Server:
             obj = self.entity_index.get(ent_id)
             if not obj:
                 return
-
-            # passendes Mapping finden
             m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
             if not m:
                 return
-
             new_state = data.get("new_state") or {}
-            # Wert extrahieren
             if m.mode == "attr" and m.attr:
                 val = (new_state.get("attributes") or {}).get(m.attr)
             else:
                 val = new_state.get("state")
-
-            # in BACnet-Objekt schreiben
             if m.object_type == "analogValue":
                 try:
                     if val in (None, "", "unknown", "unavailable"):
-                        obj.presentValue = 0.0  # type: ignore
+                        obj.presentValue = 0.0  # type: ignore[attr-defined]
                     else:
-                        obj.presentValue = float(val)  # type: ignore
+                        obj.presentValue = float(val)  # type: ignore[attr-defined]
                 except Exception:
-                    obj.presentValue = 0.0  # type: ignore
-            else:  # binaryValue
-                obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
-
+                    obj.presentValue = 0.0  # type: ignore[attr-defined]
+            else:
+                obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore[attr-defined]
             LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
-            # (optional) COV-Notifications könnten hier gesendet werden.
         except Exception as exc:
             LOG.debug("state_changed handling failed: %s", exc)
 
