@@ -57,7 +57,7 @@ def configure_bacpypes_debug(level_name: str):
         "warning": logging.WARNING,
         "error": logging.ERROR,
     }
-    level = level_map.get((level_name or "info").lower(), logging.INFO)
+    level = level_map.get((level_name or "debug").lower(), logging.INFO)
 
     logging.getLogger("bacpypes3").setLevel(level)
     for name in (
