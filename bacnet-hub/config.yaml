@@ -16,6 +16,8 @@ map:
 options:
   ha_url: "ws://supervisor/core/websocket"   # Standard: Supervisor-Proxy
   long_lived_token: ""                       # Fallback (leer lassen, wenn Supervisor-Token klappt)
+  bacpypes_log_level: "info"
 schema:
   ha_url: str
   long_lived_token: str
+  bacpypes_log_level: list(info|debug|warning)?
