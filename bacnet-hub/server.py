@@ -17,8 +17,6 @@ level_map = {
     "warning": logging.WARNING,
 }
 
-# Debug für alle bacpypes3-Module aktivieren
-enable_debug(level=level_map.get(BACPYTES_LOG_LEVEL, logging.INFO))
 
 async def maybe_await(x):
     if inspect.isawaitable(x):
