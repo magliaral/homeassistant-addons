@@ -48,7 +48,7 @@ except Exception:
         def __init__(self, _): pass
         def __getattr__(self, _): return lambda *a, **k: None
 
-_debug = 1 if BACPYPES_LOG_LEVEL == "debug" else 0
+_debug = 1
 _log = ModuleLogger(globals())
 
 def configure_bacpypes_debug(level_name: str):
