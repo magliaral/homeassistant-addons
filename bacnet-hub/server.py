@@ -94,10 +94,32 @@ def dump_obj_debug(prefix: str, obj) -> None:
     except Exception as exc:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
+def _pid_is_present_value(prop) -> bool:
+    """
+    Erkenne 'present-value' robust, egal ob Enum oder String:
+    'present-value', 'present_value', 'presentValue', PropertyIdentifier.present_value, etc.
+    """
+    try:
+        pid = getattr(prop, "propertyIdentifier", prop)
+    except Exception:
+        pid = prop
+    # Enum? Dann .name oder .value probieren
+    txt = None
+    for attr in ("name", "value"):
+        if hasattr(pid, attr):
+            v = getattr(pid, attr)
+            if isinstance(v, str):
+                txt = v
+                break
+    if txt is None:
+        txt = str(pid)
+    norm = txt.replace("-", "").replace("_", "").lower()
+    return norm == "presentvalue"
+
 # -----------------------------------------------------------
 # YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CFG_DIR = "/config/bacnet-hub"
+DEFAULT_CFG_DIR = "/config/bacnet_hub"
 DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
 DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
 
@@ -142,7 +164,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     if dev.get("address"):
         argv.extend(["--address", str(dev["address"])])
     if dev.get("port"):
-        argv.extend(["--port", str(int(dev["port"]))])
+        argv.extend(["--port", str(int(dev.get("port")))])
 
     if _debug:
         LOG.debug("Finale argv aus YAML: %r", argv)
@@ -247,7 +269,7 @@ class Mapping:
     writable: bool = False
     mode: str = "state"     # state | attr
     attr: Optional[str] = None
-    name: Optional[str] = None
+    name: Optional[string] = None
     write: Optional[Dict[str, Any]] = None
 
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
@@ -282,7 +304,14 @@ def import_bacpypes():
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
-    return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
+    # Optional: BinaryPV Enum zum Erkennen von active/inactive
+    BinaryPV = None
+    try:
+        BinaryPV = import_module("bacpypes3.basetypes").BinaryPV
+    except Exception:
+        BinaryPV = None
+
+    return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address, BinaryPV
 
 # -----------------------------------------------------------
 # Server
@@ -307,7 +336,7 @@ class Server:
         dev = cfg.get("device", {}) or {}
         objs = cfg.get("objects", []) or []
         self.cfg_device = {
-            "device_id": int(dev.get("device_id", 3600)),
+            "device_id": int(dev.get("device_id", 500000)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
@@ -343,10 +372,11 @@ class Server:
         parser = SimpleArgumentParser()
         return parser.parse_args(argv)
 
-    async def _add_object(self, app, m: Mapping, AV, BV):
+    async def _add_object(self, app, m: Mapping, AV, BV, BinaryPV):
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
+        # --- analogValue ---
         if m.object_type == "analogValue":
             obj = AV(objectIdentifier=key, objectName=name, presentValue=0.0)
             if m.units and hasattr(obj, "units"):
@@ -354,11 +384,11 @@ class Server:
                 if units is not None:
                     obj.units = units  # type: ignore
 
+            # READ
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
                 async def dyn_read(prop, arrayIndex=None):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
+                    if _pid_is_present_value(prop) and self.ha:
                         val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
                         try:
                             obj.presentValue = float(val or 0.0)  # type: ignore
@@ -367,11 +397,13 @@ class Server:
                     return await maybe_await(orig(prop, arrayIndex))
                 obj.ReadProperty = dyn_read  # type: ignore
 
-            if hasattr(obj, "WriteProperty") and m.writable:
-                origw = obj.WriteProperty
+            # WRITE
+            # Manche Klassen haben 'WriteProperty', manche 'write_property'
+            write_attr_name = "WriteProperty" if hasattr(obj, "WriteProperty") else ("write_property" if hasattr(obj, "write_property") else None)
+            if write_attr_name and m.writable:
+                origw = getattr(obj, write_attr_name)
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
+                    if _pid_is_present_value(prop) and self.ha:
                         raw = value
                         try:
                             if hasattr(raw, "get_value"):
@@ -387,25 +419,28 @@ class Server:
                                  m.object_type, m.instance, num, priority)
                         await self._write_to_ha(m, num)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-                obj.WriteProperty = dyn_write  # type: ignore
+                setattr(obj, write_attr_name, dyn_write)  # type: ignore
 
-        else:  # binaryValue
+        # --- binaryValue ---
+        else:
             obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
+
+            # READ
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
                 async def dyn_read(prop, arrayIndex=None):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
+                    if _pid_is_present_value(prop) and self.ha:
                         val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
                         obj.presentValue = bool(val)  # type: ignore
                     return await maybe_await(orig(prop, arrayIndex))
                 obj.ReadProperty = dyn_read  # type: ignore
 
-            if hasattr(obj, "WriteProperty") and m.writable:
-                origw = obj.WriteProperty
+            # WRITE
+            write_attr_name = "WriteProperty" if hasattr(obj, "WriteProperty") else ("write_property" if hasattr(obj, "write_property") else None)
+            if write_attr_name and m.writable:
+                origw = getattr(obj, write_attr_name)
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
+                    if _pid_is_present_value(prop) and self.ha:
                         raw = value
                         try:
                             if hasattr(raw, "get_value"):
@@ -415,24 +450,32 @@ class Server:
                         except Exception:
                             pass
 
-                        # Boolean / Zahl / String / Enum robust interpretieren
                         on = False
                         s = str(raw).lower()
                         if s in ("1","true","on","active","open"):
                             on = True
                         elif s in ("0","false","off","inactive","closed"):
                             on = False
-                        elif "active" in s:  # z.B. "BinaryPV.active"
+                        elif "active" in s:
                             on = True
+                        # Enum BinaryPV?
+                        if not on and BinaryPV is not None:
+                            try:
+                                if raw == getattr(BinaryPV, "active"):
+                                    on = True
+                                elif raw == getattr(BinaryPV, "inactive"):
+                                    on = False
+                            except Exception:
+                                pass
 
                         LOG.info("BV Write %s:%s -> %s (prio=%s) -> HA",
                                  m.object_type, m.instance, on, priority)
                         await self._write_to_ha(m, on)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-                obj.WriteProperty = dyn_write  # type: ignore
+                setattr(obj, write_attr_name, dyn_write)  # type: ignore
 
         await maybe_await(app.add_object(obj))
-        self.entity_index[m.entity_id] = obj  # für Live-Updates merken
+        self.entity_index[m.entity_id] = obj
         LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _write_to_ha(self, m: Mapping, value):
@@ -443,7 +486,7 @@ class Server:
           - "<domain>.<service>"    -> generisch + optional payload_key / extra
         """
         if not (m.writable and m.write and m.write.get("service")):
-            LOG.debug("Write ignored (kein Service definiert) für %s", m.entity_id)
+            LOG.warning("Write ignored (kein Service definiert) für %s", m.entity_id)
             return
 
         svc = m.write["service"]
@@ -474,7 +517,7 @@ class Server:
             await self.ha.call_service(domain, service, data)
             return
 
-        LOG.debug("Unbekanntes Serviceformat: %s", svc)
+        LOG.warning("Unbekanntes Serviceformat: %s", svc)
 
     async def _initial_sync(self):
         """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben."""
@@ -503,11 +546,11 @@ class Server:
         await self.ha.connect()
         await self.ha.prime_states()
 
-        # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
-        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        # 3) BACpypes importieren & Parser/Args vorbereiten
+        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address, BinaryPV = import_bacpypes()
         args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
-        # 4) Application starten (wie in deinem funktionierenden Beispiel)
+        # 4) Application starten
         app = Application.from_args(args)
         self.app = app
 
@@ -529,7 +572,7 @@ class Server:
             except Exception:
                 LOG.debug("args: %r", vars(args))
 
-        bind_addr = getattr(args, "address", None) or "192.168.31.36/24"
+        bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
@@ -541,7 +584,7 @@ class Server:
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
                 LOG.warning("Unsupported type %s", m.object_type); continue
-            await self._add_object(self.app, m, AV, BV)
+            await self._add_object(self.app, m, AV, BV, BinaryPV)
 
         # 6) **Initiale Synchronisierung**
         await self._initial_sync()
