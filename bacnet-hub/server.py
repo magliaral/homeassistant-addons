@@ -8,6 +8,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 LOG = logging.getLogger("bacnet_hub_addon")
 logging.getLogger("bacpypes3").setLevel(logging.WARNING)
 
+BACPYTES_LOG_LEVEL = os.environ.get("BACNET_LOG_LEVEL", "info").lower()
+
+# Mapping zu bacpypes3 debug
+level_map = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+}
+
+# Debug für alle bacpypes3-Module aktivieren
+enable_debug(level=level_map.get(BACPYTES_LOG_LEVEL, logging.INFO))
+
 async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
@@ -163,8 +175,10 @@ def import_bacpypes():
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
 SUPPORTED_TYPES = {"analogValue","binaryValue"}
 
+@bacpypes_debugging
 class Server:
     def __init__(self, cfg_path="/config/bacnet-hub/mappings.yaml"):
+        _LOGGER.debug("BACnetServerApp init mit bacpypes3 Debug-Level: %s", BACPYTES_LOG_LEVEL)
         self.cfg_path = cfg_path
         self.cfg = {}
         self.mappings: List[Mapping] = []
