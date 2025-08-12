@@ -10,7 +10,7 @@ boot: auto
 host_network: true
 hassio_api: true
 homeassistant_api: true
-hassio_role: homeassistant
+hassio_role: admin
 init: false
 map:
   - config:rw
