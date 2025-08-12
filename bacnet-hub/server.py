@@ -20,7 +20,7 @@ logging.basicConfig(
 LOG = logging.getLogger("bacnet_hub_addon")
 
 # -----------------------------------------------------------
-# Add-on Optionen
+# Add-on-Optionen
 # -----------------------------------------------------------
 def load_addon_options() -> Dict[str, Any]:
     try:
@@ -56,7 +56,7 @@ def configure_bacpypes_debug(level_name: str):
     }
     level = level_map.get((level_name or "info").lower(), logging.INFO)
 
-    # damit ModuleLogger-Ausgaben sichtbar werden
+    # ModuleLogger-Ausgaben sichtbar machen
     if level == logging.DEBUG:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger("__main__").setLevel(logging.DEBUG)
@@ -94,9 +94,9 @@ def dump_obj_debug(prefix: str, obj) -> None:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
 # -----------------------------------------------------------
-# YAML laden und argv für BACpypes bauen (wie in deinem Beispiel)
+# YAML laden und argv für BACpypes bauen
 # -----------------------------------------------------------
-DEFAULT_CONFIG_PATH = "/config/bacnet-hub/mappings.yaml"
+DEFAULT_CONFIG_PATH = "/config/bacnet_hub/mappings.yaml"
 
 def _load_yaml_config(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -136,9 +136,8 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     elif "options" in bac and isinstance(bac["options"], dict):
         argv.extend(_bacpypes_dict_to_argv(bac["options"]))
 
-    # device: (fallbacks → häufige Keys mappen)
+    # device fallbacks
     dev = config.get("device", {}) or {}
-    # falls nicht in bacpypes.options gesetzt, ergänzen:
     if "--device-instance" not in argv and "-i" not in argv and dev.get("device_id"):
         argv.extend(["--device-instance", str(int(dev["device_id"]))])
     if dev.get("address"):
@@ -151,7 +150,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     return argv
 
 # -----------------------------------------------------------
-# HA WebSocket Client
+# Home Assistant WebSocket Client
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
@@ -216,7 +215,7 @@ class HAWS:
                     data = evt["event"]["data"]
                     ent_id = data["entity_id"]
                     self.state_cache[ent_id] = data.get("new_state") or {}
-                    await on_event(data)
+                    await on_event(data)   # wir geben nur den 'data'-Teil weiter
 
         asyncio.create_task(_loop())
 
@@ -266,7 +265,6 @@ def import_bacpypes():
     _Unsigned = import_module("bacpypes3.primitivedata").Unsigned
     _Address = import_module("bacpypes3.pdu").Address
 
-    # Objektklassen robust finden
     AV = BV = None
     for mod, av, bv in [
         ("bacpypes3.local.object", "AnalogValueObject", "BinaryValueObject"),
@@ -298,6 +296,9 @@ class Server:
         self.ha: Optional[HAWS] = None
         self.app = None
         self.device = None
+
+        # NEU: entity_id -> bacpypes Objekt (für schnelle Updates)
+        self.entity_index: Dict[str, Any] = {}
 
     def load_config(self) -> Dict[str, Any]:
         cfg = _load_yaml_config(self.cfg_path)
@@ -365,6 +366,7 @@ class Server:
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
+        self.entity_index[m.entity_id] = obj  # <— für Live-Updates merken
         LOG.info("Added %s:%s -> %s", *key, m.entity_id)
 
     async def _write_to_ha(self, m: Mapping, value):
@@ -398,30 +400,31 @@ class Server:
         # 3) BACpypes importieren
         Application, SimpleArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
 
-        # 4) Parser wie im Beispiel + Application.from_args
+        # 4) Parser + Application.from_args (wie in deinem funktionierenden Beispiel)
         parser = SimpleArgumentParser()
-        # (wir parsen **nur** argv aus YAML, nicht sys.argv)
-        args = parser.parse_args(argv)
+        args = parser.parse_args(argv)  # nur YAML-argv
 
-        # App aus Args erstellen (dein funktionierendes Pattern)
         app = Application.from_args(args)
         self.app = app
 
-        # lokales Device holen (liegt in der Application)
-        # in neueren Versionen: app.local_device; ansonsten im objectIdentifier-Index
+        # Device referenzieren
         dev = getattr(app, "local_device", None)
         if not dev:
-            # heuristik: erstes DeviceObject aus app.objectIdentifier
             for obj in app.objectIdentifier.values():
                 if isinstance(obj, DeviceObject):
                     dev = obj
                     break
         self.device = dev
 
+        # Logs wie erwartet
         if _debug:
-            LOG.debug("args: %r", vars(args))
-            LOG.debug("settings: %s", dict(getattr(__import__("bacpypes3.settings","*"), "settings", {})))
-        # Bind-Adresse aus Args extrahieren (nur fürs Log)
+            try:
+                from bacpypes3.settings import settings as bp_settings
+                LOG.debug("args: %r", vars(args))
+                LOG.debug("settings: %s", dict(bp_settings))
+            except Exception:
+                LOG.debug("args: %r", vars(args))
+
         bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg["device_id"])
@@ -436,8 +439,44 @@ class Server:
                 LOG.warning("Unsupported type %s", m.object_type); continue
             await self._add_object(self.app, m, AV, BV)
 
-    async def _on_state_changed(self, event):
-        return  # (COV später)
+    async def _on_state_changed(self, data: Dict[str, Any]):
+        """Live-Update der presentValue bei HA-Änderungen."""
+        try:
+            ent_id = data.get("entity_id")
+            if not ent_id:
+                return
+            obj = self.entity_index.get(ent_id)
+            if not obj:
+                return
+
+            # passendes Mapping finden
+            m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
+            if not m:
+                return
+
+            new_state = data.get("new_state") or {}
+            # Wert extrahieren
+            if m.mode == "attr" and m.attr:
+                val = (new_state.get("attributes") or {}).get(m.attr)
+            else:
+                val = new_state.get("state")
+
+            # in BACnet-Objekt schreiben
+            if m.object_type == "analogValue":
+                try:
+                    if val in (None, "", "unknown", "unavailable"):
+                        obj.presentValue = 0.0  # type: ignore
+                    else:
+                        obj.presentValue = float(val)  # type: ignore
+                except Exception:
+                    obj.presentValue = 0.0  # type: ignore
+            else:  # binaryValue
+                obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
+
+            LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
+            # Hinweis: COV-Notifications könnten hier optional gesendet werden.
+        except Exception as exc:
+            LOG.debug("state_changed handling failed: %s", exc)
 
     async def run_forever(self):
         await self.start()
