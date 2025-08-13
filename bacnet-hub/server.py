@@ -579,9 +579,6 @@ class Server:
         # 7) Live-Events abonnieren
         await self.ha.subscribe_state_changes(self._on_state_changed)
 
-        # INFO-Heartbeat: hält den Log-Stream im Info-Modus aktiv
-        asyncio.create_task(_periodic_info_heartbeat(LOG, interval_s=60))
-
     async def _on_state_changed(self, data: Dict[str, Any]):
         """Live-Update der presentValue bei HA-Änderungen."""
         try:
