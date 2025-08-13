@@ -1,17 +1,14 @@
-#!/usr/bin/with-contenv bashio
+#!/usr/bin/env bash
 set -e
 
-TZ_VALUE=$(bashio::config 'TZ')
-if [ -z "$TZ_VALUE" ]; then
-    TZ_VALUE="Europe/Zurich"
+# TZ aus Option/Environment anwenden
+if [ -n "$TZ" ] && [ -e "/usr/share/zoneinfo/$TZ" ]; then
+  ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+  echo "$TZ" > /etc/timezone 2>/dev/null || true
 fi
 
-if [ -e "/usr/share/zoneinfo/$TZ_VALUE" ]; then
-    ln -snf "/usr/share/zoneinfo/$TZ_VALUE" /etc/localtime
-    echo "$TZ_VALUE" > /etc/timezone
-else
-    echo "WARN: Zeitzone $TZ_VALUE nicht gefunden, bleibe bei UTC"
-fi
+# optional: Uhrzeit ausgeben, zu Kontrolle
+date
 
-date  # nur zur Kontrolle
+# deine App starten
 exec /venv/bin/python /usr/src/app/server.py
