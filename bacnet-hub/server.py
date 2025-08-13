@@ -611,7 +611,7 @@ class Server:
                 # --- GUARD wieder entfernen ---
                 self._set_inbound_from_ha(obj, False)
 
-            LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
+            LOG.info("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
             # (optional) COV-Notifications könnten hier gesendet werden.
         except Exception as exc:
             LOG.debug("state_changed handling failed: %s", exc)
