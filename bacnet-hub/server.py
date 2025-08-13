@@ -18,6 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logging.Formatter.converter = time.localtime
 LOG = logging.getLogger("bacnet_hub_addon")
 
 async def _periodic_info_heartbeat(logger: logging.Logger, interval_s: int = 600):
