@@ -343,6 +343,34 @@ class Server:
         parser = SimpleArgumentParser()
         return parser.parse_args(argv)
 
+    # ----------------------------
+    # HA-Push / Guard-Helfer
+    # ----------------------------
+    def _coerce_for_ha(self, m: Mapping, raw_value):
+        """Rohwert robust in HA-Payload umwandeln (analog/binary)."""
+        if m.object_type == "analogValue":
+            try:
+                if hasattr(raw_value, "get_value"):
+                    raw_value = raw_value.get_value()
+                elif hasattr(raw_value, "value"):
+                    raw_value = raw_value.value
+                return float(raw_value)
+            except Exception:
+                return 0.0
+        else:
+            s = str(getattr(raw_value, "value", raw_value)).lower()
+            if s in ("1","true","on","active","open","heat","cool"):
+                return True
+            if s in ("0","false","off","inactive","closed"):
+                return False
+            return "active" in s or s == "1"
+
+    def _is_inbound_from_ha(self, obj) -> bool:
+        return getattr(obj, "_ha_inbound_guard", False)
+
+    def _set_inbound_from_ha(self, obj, flag: bool):
+        setattr(obj, "_ha_inbound_guard", bool(flag))
+
     async def _add_object(self, app, m: Mapping, AV, BV):
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
@@ -430,6 +458,50 @@ class Server:
                         await self._write_to_ha(m, on)
                     return await maybe_await(origw(prop, value, arrayIndex, priority, direct))
                 obj.WriteProperty = dyn_write  # type: ignore
+
+        # --- Property-Change Hook: auf effektive Änderungen reagieren ---
+        orig_prop_change = getattr(obj, "property_change", None)
+
+        async def _ha_property_change(property_name: str, value):
+            # ursprüngliches Verhalten
+            if callable(orig_prop_change):
+                res = orig_prop_change(property_name, value)
+                if inspect.isawaitable(res):
+                    await res
+
+            # Änderungen ignorieren, wenn sie durch HA ausgelöst wurden
+            if self._is_inbound_from_ha(obj):
+                return
+
+            # Interessante Properties?
+            required = getattr(obj, "_required", ())
+            if property_name in required:
+                # Effektiven presentValue abfragen
+                try:
+                    pv = getattr(obj, "presentValue", None)
+                except Exception:
+                    pv = None
+
+                if pv is not None and self.ha:
+                    # passendes Mapping suchen
+                    m_match = None
+                    for mm in self.mappings:
+                        if self.entity_index.get(mm.entity_id) is obj:
+                            m_match = mm
+                            break
+                    if not m_match:
+                        return
+
+                    # nur pushen, wenn Mapping das wünscht
+                    if not (m_match.writable and m_match.write and m_match.write.get("service")):
+                        return
+
+                    coerced = self._coerce_for_ha(m_match, pv)
+                    LOG.debug("property_change: %s -> presentValue=%r -> HA push", property_name, coerced)
+                    asyncio.create_task(self._write_to_ha(m_match, coerced))
+
+        # Hook setzen (monkeypatch)
+        setattr(obj, "property_change", _ha_property_change)
 
         await maybe_await(app.add_object(obj))
         self.entity_index[m.entity_id] = obj  # für Live-Updates merken
@@ -571,17 +643,23 @@ class Server:
             else:
                 val = new_state.get("state")
 
-            # in BACnet-Objekt schreiben
-            if m.object_type == "analogValue":
-                try:
-                    if val in (None, "", "unknown", "unavailable"):
+            # --- GUARD setzen: diese Änderung stammt aus HA ---
+            self._set_inbound_from_ha(obj, True)
+            try:
+                # in BACnet-Objekt schreiben
+                if m.object_type == "analogValue":
+                    try:
+                        if val in (None, "", "unknown", "unavailable"):
+                            obj.presentValue = 0.0  # type: ignore
+                        else:
+                            obj.presentValue = float(val)  # type: ignore
+                    except Exception:
                         obj.presentValue = 0.0  # type: ignore
-                    else:
-                        obj.presentValue = float(val)  # type: ignore
-                except Exception:
-                    obj.presentValue = 0.0  # type: ignore
-            else:  # binaryValue
-                obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
+                else:  # binaryValue
+                    obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
+            finally:
+                # --- GUARD wieder entfernen ---
+                self._set_inbound_from_ha(obj, False)
 
             LOG.debug("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
             # (optional) COV-Notifications könnten hier gesendet werden.
