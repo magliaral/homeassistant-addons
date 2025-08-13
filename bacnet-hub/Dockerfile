@@ -3,7 +3,7 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Systempakete
-RUN apk add --no-cache python3 py3-pip bash
+RUN apk add --no-cache python3 py3-pip tzdata bash
 
 # Virtuelle Umgebung anlegen (um PEP 668 zu umgehen)
 RUN python3 -m venv /venv
