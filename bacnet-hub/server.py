@@ -451,7 +451,9 @@ class Server:
     # Wrapper-Fabriken für Read/Write (unterstützt CamelCase + snake_case)
     # ----------------------------
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
+        LOG.debug("_make_write_wrapper")
         async def dyn_write(_self, *args, **kwargs):
+            LOG.debug("dyn_write")
             # 1) Property-Identifier robust auslesen
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid = self._extract_prop_id(prop)
