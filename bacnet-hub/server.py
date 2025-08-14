@@ -190,13 +190,6 @@ async def main():
 # Main
 # -----------------------------------------------------------
 if __name__ == "__main__":
-    # Log-Level des Root/Paket-Loggers passend setzen
-    if BACPYPES_LOG_LEVEL == "debug":
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("bacpypes3").setLevel(logging.DEBUG)
-        logging.getLogger(__name__).setLevel(logging.DEBUG)
-        LOG.setLevel(logging.DEBUG)
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
