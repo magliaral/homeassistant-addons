@@ -354,6 +354,23 @@ class Server:
         # entity_id -> bacpypes Objekt (für schnelle Updates)
         self.entity_index: Dict[str, Any] = {}
 
+    # ----------------------------
+    # Utility: Property-ID extrahieren (robust)
+    # ----------------------------
+    @staticmethod
+    def _extract_prop_id(prop) -> str:
+        # prop kann Enum, BACnet-Klasse (mit propertyIdentifier) oder String sein
+        try:
+            pid = getattr(prop, "propertyIdentifier", None)
+            if pid:
+                return str(pid)
+        except Exception:
+            pass
+        try:
+            return str(prop)
+        except Exception:
+            return "presentValue"
+
     def load_config(self) -> None:
         cfg = _load_yaml(self.cfg_path)
         self.cfg_all = cfg
@@ -429,11 +446,55 @@ class Server:
         # Umgehen der bacpypes __setattr__:
         object.__setattr__(obj, "_ha_inbound_guard", bool(flag))
 
+    # ----------------------------
+    # Wrapper-Fabriken für Read/Write (unterstützt CamelCase + snake_case)
+    # ----------------------------
+    def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
+        async def dyn_write(*args, **kwargs):
+            # 1) Property-Identifier robust auslesen
+            prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
+            pid = self._extract_prop_id(prop)
+
+            # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
+            result = await maybe_await(orig_write(*args, **kwargs))
+
+            # 3) Nachher: ggf. zu HA spiegeln
+            if self.ha and (pid in watched_properties):
+                if (not self._is_inbound_from_ha(obj)) and m.writable and m.write and m.write.get("service"):
+                    pv_after = getattr(obj, "presentValue", None)
+                    coerced = self._coerce_for_ha(m, pv_after)
+                    LOG.info(
+                        "BACnet change via %s %s:%s -> PV=%s -> push to HA",
+                        pid, m.object_type, m.instance, coerced
+                    )
+                    asyncio.create_task(self._write_to_ha(m, coerced))
+            return result
+        return dyn_write
+
+    def _make_read_wrapper(self, m: Mapping, obj, orig_read):
+        async def dyn_read(*args, **kwargs):
+            prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
+            pid = self._extract_prop_id(prop)
+
+            if pid == "presentValue" and self.ha:
+                # JIT-Refresh aus HA
+                if m.object_type == "analogValue":
+                    val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                    try:
+                        obj.presentValue = float(val or 0.0)  # type: ignore
+                    except Exception:
+                        obj.presentValue = 0.0  # type: ignore
+                else:
+                    val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                    obj.presentValue = bool(val)  # type: ignore
+
+            return await maybe_await(orig_read(*args, **kwargs))
+        return dyn_read
+
     async def _add_object(self, app, m: Mapping, AV, BV):
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
-        # Welche Property-Writes sollen HA-Updates triggern?
         watched_properties = {"presentValue", "priorityArray", "relinquishDefault", "outOfService"}
 
         if m.object_type == "analogValue":
@@ -442,77 +503,26 @@ class Server:
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
                     obj.units = units  # type: ignore
-
-            if hasattr(obj, "ReadProperty"):
-                orig = obj.ReadProperty
-
-                async def dyn_read(prop, arrayIndex=None):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
-                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
-                        try:
-                            obj.presentValue = float(val or 0.0)  # type: ignore
-                        except Exception:
-                            obj.presentValue = 0.0  # type: ignore
-                    return await maybe_await(orig(prop, arrayIndex))
-
-                obj.ReadProperty = dyn_read  # type: ignore
-
-            if hasattr(obj, "WriteProperty"):
-                origw = obj.WriteProperty
-
-                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    # 1) Originalen Write ausführen (damit PV/Prio-Logik korrekt ist)
-                    result = await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-
-                    # 2) Falls vom BACnet kommend, PUSH zu HA (wenn gewünscht)
-                    if self.ha and (pid in watched_properties):
-                        if not self._is_inbound_from_ha(obj) and m.writable and m.write and m.write.get("service"):
-                            pv_after = getattr(obj, "presentValue", None)
-                            num = self._coerce_for_ha(m, pv_after)
-                            LOG.info("AV Change via %s %s:%s -> PV=%s -> HA", pid, m.object_type, m.instance, num)
-                            asyncio.create_task(self._write_to_ha(m, num))
-
-                    return result
-
-                obj.WriteProperty = dyn_write  # type: ignore
-
         else:  # binaryValue
             obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
 
-            if hasattr(obj, "ReadProperty"):
-                orig = obj.ReadProperty
+        # --- Hooks setzen: ReadProperty / read_property ---
+        orig_read_camel = getattr(obj, "ReadProperty", None)
+        if callable(orig_read_camel):
+            obj.ReadProperty = self._make_read_wrapper(m, obj, orig_read_camel)  # type: ignore
 
-                async def dyn_read(prop, arrayIndex=None):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-                    if pid == "presentValue" and self.ha:
-                        val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                        obj.presentValue = bool(val)  # type: ignore
-                    return await maybe_await(orig(prop, arrayIndex))
+        orig_read_snake = getattr(obj, "read_property", None)
+        if callable(orig_read_snake):
+            obj.read_property = self._make_read_wrapper(m, obj, orig_read_snake)  # type: ignore
 
-                obj.ReadProperty = dyn_read  # type: ignore
+        # --- Hooks setzen: WriteProperty / write_property ---
+        orig_write_camel = getattr(obj, "WriteProperty", None)
+        if callable(orig_write_camel):
+            obj.WriteProperty = self._make_write_wrapper(m, obj, orig_write_camel, watched_properties)  # type: ignore
 
-            if hasattr(obj, "WriteProperty"):
-                origw = obj.WriteProperty
-
-                async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
-                    pid = getattr(prop, "propertyIdentifier", str(prop))
-
-                    # 1) Originalen Write zuerst
-                    result = await maybe_await(origw(prop, value, arrayIndex, priority, direct))
-
-                    # 2) Danach effektiven PV holen und (wenn gewünscht) nach HA pushen
-                    if self.ha and (pid in watched_properties):
-                        if not self._is_inbound_from_ha(obj) and m.writable and m.write and m.write.get("service"):
-                            pv_after = getattr(obj, "presentValue", None)
-                            on = self._coerce_for_ha(m, pv_after)
-                            LOG.info("BV Change via %s %s:%s -> PV=%s -> HA", pid, m.object_type, m.instance, on)
-                            asyncio.create_task(self._write_to_ha(m, on))
-
-                    return result
-
-                obj.WriteProperty = dyn_write  # type: ignore
+        orig_write_snake = getattr(obj, "write_property", None)
+        if callable(orig_write_snake):
+            obj.write_property = self._make_write_wrapper(m, obj, orig_write_snake, watched_properties)  # type: ignore
 
         await maybe_await(app.add_object(obj))
         self.entity_index[m.entity_id] = obj  # für Live-Updates merken
@@ -599,7 +609,7 @@ class Server:
         ) = import_bacpypes()
         args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
-        # 4) Application starten (wie in deinem funktionierenden Beispiel)
+        # 4) Application starten
         app = Application.from_args(args)
         self.app = app
 
@@ -616,7 +626,6 @@ class Server:
         if _debug:
             try:
                 from bacpypes3.settings import settings as bp_settings
-
                 LOG.debug("args: %r", vars(args))
                 LOG.debug("settings: %s", dict(bp_settings))
             except Exception:
