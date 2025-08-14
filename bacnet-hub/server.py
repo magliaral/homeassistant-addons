@@ -453,13 +453,15 @@ class Server:
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
         LOG.debug("_make_write_wrapper")
         async def dyn_write(_self, *args, **kwargs):
-            LOG.debug("dyn_write")
+            
             # 1) Property-Identifier robust auslesen
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid = self._extract_prop_id(prop)
+            LOG.debug("BACnet change orig_writen - %s : %s", prop, pid)
 
             # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
             result = await maybe_await(orig_write(*args, **kwargs))
+            LOG.debug("BACnet change orig_writen - %s",result)
 
             # 3) Nachher: ggf. zu HA spiegeln
             if self.ha and (pid in watched_properties):
