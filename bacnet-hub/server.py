@@ -679,11 +679,6 @@ class Server:
         bind_port = getattr(args, "port", None) or 47808
         bind_instance = getattr(args, "instance", None) or 47808
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, bind_instance)
-        LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
-        if self.device:
-            LOG.debug("local_device: %r", self.device)
-            dump_obj_debug("local_device contents:", self.device)
-        LOG.debug("app: %r", self.app)
 
         # 5) Objekte anlegen
         for m in self.mappings:
