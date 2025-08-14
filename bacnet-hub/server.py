@@ -13,7 +13,6 @@ from typing import Any, Dict, List
 
 # some debugging
 _debug = 0
-_log = ModuleLogger(globals())
 
 # -----------------------------------------------------------
 # Grund-Logging
