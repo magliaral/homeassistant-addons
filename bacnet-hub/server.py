@@ -493,41 +493,62 @@ class Server:
     # ----------------------------
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
         LOG.debug("Setup write wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
-    
+
         async def dyn_write(_self, *args, **kwargs):
             LOG.debug(
                 "[WRITE] Incoming BACnet write request → %s:%s (%s) | args=%s kwargs=%s",
                 m.object_type, m.instance, m.entity_id, args, kwargs
             )
-    
+
             # 1) Property-Identifier robust auslesen + normalisieren
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid_raw = self._extract_prop_id(prop)
             pid = self._norm_pid(pid_raw)
             LOG.debug("[WRITE] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
-    
+
             # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
             result = await maybe_await(orig_write(*args, **kwargs))
             LOG.debug("[WRITE] Original BACnet write completed → result=%s", result)
-    
+
             # 3) Nachher: ggf. zu HA spiegeln
             if self.ha and (pid in watched_properties):
-                if (not self._is_inbound_from_ha(obj)) and m.writable and m.write and m.write.get("service"):
-                    pv_after = getattr(obj, "presentValue", None)
-                    coerced = self._coerce_for_ha(m, pv_after)
-                    LOG.info(
-                        "[WRITE] BACnet change detected → %s:%s (%s) | Property=%s | PV(after)=%s → Sync to HA",
-                        m.object_type, m.instance, m.entity_id, pid_raw, coerced
+                if self._is_inbound_from_ha(obj):
+                    LOG.debug("[WRITE] Change ignored (source=HA)")
+                    return result
+
+                if not m.writable:
+                    LOG.warning(
+                        "[WRITE] BACnet write to %s:%s (%s) ignored → mapping not writable",
+                        m.object_type, m.instance, m.entity_id
                     )
-                    asyncio.create_task(self._write_to_ha(m, coerced))
-                else:
-                    LOG.debug(
-                        "[WRITE] Change ignored (source=HA or not writable or no HA service configured)"
+                    return result
+
+                if not (m.write and m.write.get("service")):
+                    LOG.warning(
+                        "[WRITE] BACnet write to %s:%s (%s) ignored → no HA service configured",
+                        m.object_type, m.instance, m.entity_id
                     )
+                    return result
+
+                # HA-Entity bekannt?
+                if not self.ha.state_cache.get(m.entity_id):
+                    LOG.warning(
+                        "[WRITE] BACnet write to %s:%s (%s) ignored → entity not found in HA cache",
+                        m.object_type, m.instance, m.entity_id
+                    )
+                    return result
+
+                pv_after = getattr(obj, "presentValue", None)
+                coerced = self._coerce_for_ha(m, pv_after)
+                LOG.info(
+                    "[WRITE] BACnet change detected → %s:%s (%s) | Property=%s | PV(after)=%s → Sync to HA",
+                    m.object_type, m.instance, m.entity_id, pid_raw, coerced
+                )
+                asyncio.create_task(self._write_to_ha(m, coerced))
             return result
-    
+
         return dyn_write
-    
+
     def _make_read_wrapper(self, m: Mapping, obj, orig_read):
         LOG.debug("Setup read wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
 
@@ -536,13 +557,13 @@ class Server:
                 "[READ] BACnet read request → %s:%s (%s) | args=%s kwargs=%s",
                 m.object_type, m.instance, m.entity_id, args, kwargs
             )
-    
+
             # Property-ID ermitteln
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid_raw = self._extract_prop_id(prop)
             pid = self._norm_pid(pid_raw)
             LOG.debug("[READ] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
-    
+
             # Live-Update aus HA vor dem Auslesen
             if pid == "presentvalue" and self.ha:
                 if m.object_type == "analogValue":
@@ -557,11 +578,11 @@ class Server:
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
                     obj.presentValue = bool(val)  # type: ignore
                     LOG.debug("[READ] Updated binaryValue from HA → %s", obj.presentValue)
-    
+
             result = await maybe_await(orig_read(*args, **kwargs))
             LOG.debug("[READ] Original BACnet read completed → result=%s", result)
             return result
-    
+
         return dyn_read
 
 
@@ -640,6 +661,11 @@ class Server:
             LOG.debug("Write ignored (kein Service definiert) für %s", m.entity_id)
             return
 
+        # Entity im Cache vorhanden?
+        if not self.ha or not self.ha.state_cache.get(m.entity_id):
+            LOG.warning("HA write skipped: entity '%s' nicht im HA-Cache (noch nicht geladen?)", m.entity_id)
+            return
+
         svc = m.write["service"]
 
         # Kurzform: turn_on_off (light/switch etc.)
@@ -677,6 +703,10 @@ class Server:
             m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
             if not m:
                 continue
+
+            # Ist Entity im Cache?
+            if not self.ha.state_cache.get(ent_id):
+                LOG.warning("Initial sync: Entity '%s' nicht im HA-Cache gefunden", ent_id)
 
             if m.object_type == "analogValue":
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
