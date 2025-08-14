@@ -105,7 +105,7 @@ def configure_bacpypes_debug(level_name: str) -> None:
     logging.getLogger("bacpypes3").setLevel(level)
 
     # Eigene Hauptlogger optional angleichen (kein Root-Spam)
-    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app"):
+    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app", "bacpypes3.pdu"):
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
