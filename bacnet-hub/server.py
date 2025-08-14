@@ -531,38 +531,38 @@ class Server:
     def _make_read_wrapper(self, m: Mapping, obj, orig_read):
         LOG.debug("Setup read wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
 
-    async def dyn_read(_self, *args, **kwargs):
-        LOG.debug(
-            "[READ] BACnet read request → %s:%s (%s) | args=%s kwargs=%s",
-            m.object_type, m.instance, m.entity_id, args, kwargs
-        )
-
-        # Property-ID ermitteln
-        prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
-        pid_raw = self._extract_prop_id(prop)
-        pid = self._norm_pid(pid_raw)
-        LOG.debug("[READ] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
-
-        # Live-Update aus HA vor dem Auslesen
-        if pid == "presentvalue" and self.ha:
-            if m.object_type == "analogValue":
-                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
-                try:
-                    obj.presentValue = float(val or 0.0)  # type: ignore
-                    LOG.debug("[READ] Updated analogValue from HA → %s", obj.presentValue)
-                except Exception as e:
-                    LOG.warning("[READ] Could not convert HA value '%s' to float (%s)", val, e)
-                    obj.presentValue = 0.0  # type: ignore
-            else:
-                val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                obj.presentValue = bool(val)  # type: ignore
-                LOG.debug("[READ] Updated binaryValue from HA → %s", obj.presentValue)
-
-        result = await maybe_await(orig_read(*args, **kwargs))
-        LOG.debug("[READ] Original BACnet read completed → result=%s", result)
-        return result
-
-    return dyn_read
+        async def dyn_read(_self, *args, **kwargs):
+            LOG.debug(
+                "[READ] BACnet read request → %s:%s (%s) | args=%s kwargs=%s",
+                m.object_type, m.instance, m.entity_id, args, kwargs
+            )
+    
+            # Property-ID ermitteln
+            prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
+            pid_raw = self._extract_prop_id(prop)
+            pid = self._norm_pid(pid_raw)
+            LOG.debug("[READ] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
+    
+            # Live-Update aus HA vor dem Auslesen
+            if pid == "presentvalue" and self.ha:
+                if m.object_type == "analogValue":
+                    val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                    try:
+                        obj.presentValue = float(val or 0.0)  # type: ignore
+                        LOG.debug("[READ] Updated analogValue from HA → %s", obj.presentValue)
+                    except Exception as e:
+                        LOG.warning("[READ] Could not convert HA value '%s' to float (%s)", val, e)
+                        obj.presentValue = 0.0  # type: ignore
+                else:
+                    val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
+                    obj.presentValue = bool(val)  # type: ignore
+                    LOG.debug("[READ] Updated binaryValue from HA → %s", obj.presentValue)
+    
+            result = await maybe_await(orig_read(*args, **kwargs))
+            LOG.debug("[READ] Original BACnet read completed → result=%s", result)
+            return result
+    
+        return dyn_read
 
 
     async def _add_object(self, app, m: Mapping, AV, BV):
