@@ -356,7 +356,7 @@ class Server:
         self.entity_index: Dict[str, Any] = {}
 
     # ----------------------------
-    # Utility: Property-ID extrahieren (robust)
+    # Utility: Property-ID extrahieren / normalisieren
     # ----------------------------
     @staticmethod
     def _extract_prop_id(prop) -> str:
@@ -371,6 +371,11 @@ class Server:
             return str(prop)
         except Exception:
             return "presentValue"
+
+    @staticmethod
+    def _norm_pid(pid: str) -> str:
+        # "present-value" / "present_value" / "PresentValue" -> "presentvalue"
+        return "".join(ch for ch in str(pid) if ch.isalnum()).lower()
 
     def load_config(self) -> None:
         cfg = _load_yaml(self.cfg_path)
@@ -454,15 +459,16 @@ class Server:
         LOG.debug("_make_write_wrapper")
         async def dyn_write(_self, *args, **kwargs):
             LOG.debug("BACnet change dyn_write - %s : %s", args, kwargs)
-            
-            # 1) Property-Identifier robust auslesen
+
+            # 1) Property-Identifier robust auslesen + normalisieren
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
-            pid = self._extract_prop_id(prop)
-            LOG.debug("BACnet change orig_writen - %s : %s", prop, pid)
+            pid_raw = self._extract_prop_id(prop)
+            pid = self._norm_pid(pid_raw)
+            LOG.debug("pid_raw=%s pid_norm=%s", pid_raw, pid)
 
             # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
             result = await maybe_await(orig_write(*args, **kwargs))
-            LOG.debug("BACnet change orig_writen - %s",result)
+            LOG.debug("BACnet change orig_write result - %s", result)
 
             # 3) Nachher: ggf. zu HA spiegeln
             if self.ha and (pid in watched_properties):
@@ -471,7 +477,7 @@ class Server:
                     coerced = self._coerce_for_ha(m, pv_after)
                     LOG.info(
                         "BACnet change via %s %s:%s -> PV=%s -> push to HA",
-                        pid, m.object_type, m.instance, coerced
+                        pid_raw, m.object_type, m.instance, coerced
                     )
                     asyncio.create_task(self._write_to_ha(m, coerced))
             return result
@@ -480,9 +486,10 @@ class Server:
     def _make_read_wrapper(self, m: Mapping, obj, orig_read):
         async def dyn_read(_self, *args, **kwargs):
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
-            pid = self._extract_prop_id(prop)
+            pid_raw = self._extract_prop_id(prop)
+            pid = self._norm_pid(pid_raw)
 
-            if pid == "presentValue" and self.ha:
+            if pid == "presentvalue" and self.ha:
                 # JIT-Refresh aus HA
                 if m.object_type == "analogValue":
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
@@ -501,7 +508,8 @@ class Server:
         key = (m.object_type, m.instance)
         name = m.name or m.entity_id
 
-        watched_properties = {"presentValue", "priorityArray", "relinquishDefault", "outOfService"}
+        # normalisierte watched properties
+        watched_properties = {"presentvalue", "priorityarray", "relinquishdefault", "outofservice"}
 
         if m.object_type == "analogValue":
             obj = AV(objectIdentifier=key, objectName=name, presentValue=0.0)
@@ -602,7 +610,7 @@ class Server:
             m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
             if not m:
                 continue
-    
+
             if m.object_type == "analogValue":
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
                 try:
@@ -614,7 +622,7 @@ class Server:
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
                 obj.presentValue = bool(val)  # type: ignore
                 LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
-    
+
         LOG.debug("Mappings count: %d", len(self.mappings))
         LOG.debug("Entity index count: %d (unique entities)", len(self.entity_index))
         dupes = [e for e in {m.entity_id for m in self.mappings} if sum(1 for mm in self.mappings if mm.entity_id == e) > 1]
