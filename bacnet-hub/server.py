@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 import yaml
+import types
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -450,7 +451,7 @@ class Server:
     # Wrapper-Fabriken für Read/Write (unterstützt CamelCase + snake_case)
     # ----------------------------
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
-        async def dyn_write(*args, **kwargs):
+        async def dyn_write(_self, *args, **kwargs):
             # 1) Property-Identifier robust auslesen
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid = self._extract_prop_id(prop)
@@ -472,7 +473,7 @@ class Server:
         return dyn_write
 
     def _make_read_wrapper(self, m: Mapping, obj, orig_read):
-        async def dyn_read(*args, **kwargs):
+        async def dyn_read(_self, *args, **kwargs):
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
             pid = self._extract_prop_id(prop)
 
@@ -507,22 +508,42 @@ class Server:
             obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
 
         # --- Hooks setzen: ReadProperty / read_property ---
-        orig_read_camel = getattr(obj, "ReadProperty", None)
-        if callable(orig_read_camel):
-            obj.ReadProperty = self._make_read_wrapper(m, obj, orig_read_camel)  # type: ignore
+        try:
+            orig_read_camel = getattr(obj, "ReadProperty", None)
+            if callable(orig_read_camel):
+                rp = types.MethodType(self._make_read_wrapper(m, obj, orig_read_camel), obj)
+                object.__setattr__(obj, "ReadProperty", rp)
+                LOG.debug("Hooked ReadProperty for %s:%s", *key)
+        except Exception as e:
+            LOG.debug("Failed to hook ReadProperty for %s:%s: %r", *key, e)
 
-        orig_read_snake = getattr(obj, "read_property", None)
-        if callable(orig_read_snake):
-            obj.read_property = self._make_read_wrapper(m, obj, orig_read_snake)  # type: ignore
+        try:
+            orig_read_snake = getattr(obj, "read_property", None)
+            if callable(orig_read_snake):
+                rp_snake = types.MethodType(self._make_read_wrapper(m, obj, orig_read_snake), obj)
+                object.__setattr__(obj, "read_property", rp_snake)
+                LOG.debug("Hooked read_property for %s:%s", *key)
+        except Exception as e:
+            LOG.debug("Failed to hook read_property for %s:%s: %r", *key, e)
 
         # --- Hooks setzen: WriteProperty / write_property ---
-        orig_write_camel = getattr(obj, "WriteProperty", None)
-        if callable(orig_write_camel):
-            obj.WriteProperty = self._make_write_wrapper(m, obj, orig_write_camel, watched_properties)  # type: ignore
+        try:
+            orig_write_camel = getattr(obj, "WriteProperty", None)
+            if callable(orig_write_camel):
+                wp = types.MethodType(self._make_write_wrapper(m, obj, orig_write_camel, watched_properties), obj)
+                object.__setattr__(obj, "WriteProperty", wp)
+                LOG.debug("Hooked WriteProperty for %s:%s", *key)
+        except Exception as e:
+            LOG.debug("Failed to hook WriteProperty for %s:%s: %r", *key, e)
 
-        orig_write_snake = getattr(obj, "write_property", None)
-        if callable(orig_write_snake):
-            obj.write_property = self._make_write_wrapper(m, obj, orig_write_snake, watched_properties)  # type: ignore
+        try:
+            orig_write_snake = getattr(obj, "write_property", None)
+            if callable(orig_write_snake):
+                wp_snake = types.MethodType(self._make_write_wrapper(m, obj, orig_write_snake, watched_properties), obj)
+                object.__setattr__(obj, "write_property", wp_snake)
+                LOG.debug("Hooked write_property for %s:%s", *key)
+        except Exception as e:
+            LOG.debug("Failed to hook write_property for %s:%s: %r", *key, e)
 
         await maybe_await(app.add_object(obj))
         self.entity_index[m.entity_id] = obj  # für Live-Updates merken
