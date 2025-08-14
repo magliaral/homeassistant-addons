@@ -590,31 +590,31 @@ class Server:
 
         LOG.debug("Unbekanntes Serviceformat: %s", svc)
 
-async def _initial_sync(self):
-    """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben (dedupliziert)."""
-    for ent_id, obj in self.entity_index.items():
-        # passendes Mapping holen
-        m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
-        if not m:
-            continue
-
-        if m.object_type == "analogValue":
-            val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
-            try:
-                obj.presentValue = float(val or 0.0)  # type: ignore
-            except Exception:
-                obj.presentValue = 0.0  # type: ignore
-            LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
-        else:
-            val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
-            obj.presentValue = bool(val)  # type: ignore
-            LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
-
-    LOG.debug("Mappings count: %d", len(self.mappings))
-    LOG.debug("Entity index count: %d (unique entities)", len(self.entity_index))
-    dupes = [e for e in {m.entity_id for m in self.mappings} if sum(1 for mm in self.mappings if mm.entity_id == e) > 1]
-    if dupes:
-        LOG.debug("Duplicate entity_ids in mappings: %r", dupes)
+    async def _initial_sync(self):
+        """Alle aktuellen HA-Werte sofort in die BACnet-Objekte schreiben (dedupliziert)."""
+        for ent_id, obj in self.entity_index.items():
+            # passendes Mapping holen
+            m = next((mm for mm in self.mappings if mm.entity_id == ent_id), None)
+            if not m:
+                continue
+    
+            if m.object_type == "analogValue":
+                val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
+                try:
+                    obj.presentValue = float(val or 0.0)  # type: ignore
+                except Exception:
+                    obj.presentValue = 0.0  # type: ignore
+                LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
+            else:
+                val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
+                obj.presentValue = bool(val)  # type: ignore
+                LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
+    
+        LOG.debug("Mappings count: %d", len(self.mappings))
+        LOG.debug("Entity index count: %d (unique entities)", len(self.entity_index))
+        dupes = [e for e in {m.entity_id for m in self.mappings} if sum(1 for mm in self.mappings if mm.entity_id == e) > 1]
+        if dupes:
+            LOG.debug("Duplicate entity_ids in mappings: %r", dupes)
 
     async def start(self):
         # 1) YAML laden
