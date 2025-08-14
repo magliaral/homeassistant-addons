@@ -10,6 +10,7 @@ import tempfile
 import time
 import yaml
 import types
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -218,21 +219,39 @@ class HAWS:
         self._reader_task: Optional[asyncio.Task] = None
         self._send_lock = asyncio.Lock()
         self._on_event = None  # set by subscribe_state_changes
+        self._closed_event = asyncio.Event()
+
+    @property
+    def closed_event(self) -> asyncio.Event:
+        return self._closed_event
+
+    @property
+    def is_connected(self) -> bool:
+        return self.ws is not None and not self._closed_event.is_set()
 
     async def connect(self):
         import websockets
+        from websockets.exceptions import InvalidStatusCode, ConnectionClosed
 
-        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
-        first = json.loads(await self.ws.recv())
-        if first.get("type") == "auth_required":
-            await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
-            ok = json.loads(await self.ws.recv())
-            if ok.get("type") != "auth_ok":
-                raise RuntimeError(f"WS auth failed: {ok}")
-        LOG.info("HA WebSocket connected")
+        # Reset closed flag (neuer Connect-Versuch)
+        self._closed_event = asyncio.Event()
+        try:
+            self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
+            first = json.loads(await self.ws.recv())
+            if first.get("type") == "auth_required":
+                await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+                ok = json.loads(await self.ws.recv())
+                if ok.get("type") != "auth_ok":
+                    raise RuntimeError(f"WS auth failed: {ok}")
+            LOG.info("HA WebSocket connected")
 
-        # Start single reader
-        self._reader_task = asyncio.create_task(self._reader())
+            # Start single reader
+            self._reader_task = asyncio.create_task(self._reader())
+        except (OSError, InvalidStatusCode, ConnectionClosed) as e:
+            # Verbindung fehlgeschlagen → sicherstellen, dass flags gesetzt sind
+            self.ws = None
+            self._closed_event.set()
+            raise
 
     async def _reader(self):
         """Single consumer of ws.recv(); routes replies and events."""
@@ -262,15 +281,18 @@ class HAWS:
                             # do not block the reader
                             asyncio.create_task(self._on_event(data))
                     continue
-
         except asyncio.CancelledError:
             pass
         except Exception as e:
             LOG.warning("HA WS reader stopped: %r", e)
+        finally:
+            # Mark as closed so the watchdog can reconnect
+            self._closed_event.set()
+            self.ws = None
 
     async def call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Send request and await its response via the single reader."""
-        if not self.ws:
+        if not self.ws or self._closed_event.is_set():
             raise RuntimeError("WS not connected")
 
         # allocate id & future
@@ -726,14 +748,62 @@ class Server:
         if dupes:
             LOG.debug("Duplicate entity_ids in mappings: %r", dupes)
 
+    # ----------------------------
+    # HA–Verbindung robust aufbauen / überwachen
+    # ----------------------------
+    async def _connect_ha_with_retry(self):
+        """
+        Baut die HA-WS-Verbindung mit Exponential Backoff + Jitter auf,
+        lädt States und abonniert Events.
+        """
+        assert self.ha is not None
+        attempt = 0
+        base = 1.0
+        max_sleep = 30.0
+
+        while True:
+            attempt += 1
+            try:
+                await self.ha.connect()
+                await self.ha.prime_states()
+                await self.ha.subscribe_state_changes(self._on_state_changed)
+                LOG.info("HA connection established (attempt %d)", attempt)
+                return
+            except Exception as e:
+                # typischer Fall: HA startet noch oder neu
+                sleep_s = min(max_sleep, base * (2 ** (attempt - 1)))
+                # Jitter ±20%
+                jitter = sleep_s * (0.6 + 0.8 * random.random())
+                LOG.warning("HA not ready or WS connect failed (attempt %d): %r → retry in %.1fs",
+                            attempt, e, jitter)
+                await asyncio.sleep(jitter)
+
+    async def _ha_watchdog(self):
+        """Wartet auf Verbindungsabbruch und verbindet dann automatisch neu."""
+        assert self.ha is not None
+        while True:
+            await self.ha.closed_event.wait()
+            LOG.warning("HA WebSocket closed → reconnecting…")
+            # Neuer Connect + Subscribe + States
+            await self._connect_ha_with_retry()
+            # Nach Reconnect erneut initial synchronisieren
+            try:
+                await self._initial_sync()
+            except Exception as e:
+                LOG.warning("Initial sync after reconnect failed: %r", e)
+
+    # ----------------------------
+    # Start / Run
+    # ----------------------------
     async def start(self):
         # 1) YAML laden
         self.load_config()
 
-        # 2) HA verbinden
+        # 2) HA verbinden (robust)
         self.ha = HAWS()
-        await self.ha.connect()
-        await self.ha.prime_states()
+        await self._connect_ha_with_retry()
+        # Watchdog starten
+        asyncio.create_task(self._ha_watchdog())
 
         # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
         (
@@ -784,9 +854,6 @@ class Server:
 
         # 6) **Initiale Synchronisierung**
         await self._initial_sync()
-
-        # 7) Live-Events abonnieren (nur Request senden; Reader empfängt)
-        await self.ha.subscribe_state_changes(self._on_state_changed)
 
     async def _on_state_changed(self, data: Dict[str, Any]):
         """Live-Update der presentValue bei HA-Änderungen."""
