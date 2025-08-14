@@ -38,7 +38,7 @@ def init_logging(default_level: str = "INFO") -> None:
 
     # Quiet down chatty libraries by default; raise if needed later
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.warning)
 
     # Route Python warnings to logging
     logging.captureWarnings(True)
@@ -105,7 +105,7 @@ def configure_bacpypes_debug(level_name: str) -> None:
     logging.getLogger("bacpypes3").setLevel(level)
 
     # Eigene Hauptlogger optional angleichen (kein Root-Spam)
-    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app"):  # Bugfix: echtes Tuple, kein String-Iter
+    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app"):
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
@@ -263,9 +263,6 @@ class HAWS:
                             asyncio.create_task(self._on_event(data))
                     continue
 
-                # Unknown/unhandled – debug only
-                # LOG.debug("WS unhandled msg: %s", msg)
-
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -416,18 +413,6 @@ class Server:
         # "present-value" / "present_value" / "PresentValue" -> "presentvalue"
         return "".join(ch for ch in str(pid) if ch.isalnum()).lower()
 
-    # --- presentValue ohne COV setzen ---
-    def _set_pv_no_cov(self, obj, value):
-        """presentValue setzen ohne COV-Filter/Arithmetik auszulösen."""
-        try:
-            object.__setattr__(obj, "presentValue", value)
-        except Exception as e:
-            LOG.debug("Fallback PV set: %r", e)
-            try:
-                obj.presentValue = value  # type: ignore
-            except Exception as ee:
-                LOG.debug("PV set failed: %r", ee)
-
     def load_config(self) -> None:
         cfg = _load_yaml(self.cfg_path)
         self.cfg_all = cfg
@@ -545,12 +530,12 @@ class Server:
                 if m.object_type == "analogValue":
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
                     try:
-                        self._set_pv_no_cov(obj, float(val or 0.0))
+                        obj.presentValue = float(val or 0.0)  # type: ignore
                     except Exception:
-                        self._set_pv_no_cov(obj, 0.0)
+                        obj.presentValue = 0.0  # type: ignore
                 else:
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                    self._set_pv_no_cov(obj, bool(val))
+                    obj.presentValue = bool(val)  # type: ignore
 
             return await maybe_await(orig_read(*args, **kwargs))
         return dyn_read
@@ -671,13 +656,13 @@ class Server:
             if m.object_type == "analogValue":
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
                 try:
-                    self._set_pv_no_cov(obj, float(val or 0.0))
+                    obj.presentValue = float(val or 0.0)  # type: ignore
                 except Exception:
-                    self._set_pv_no_cov(obj, 0.0)
+                    obj.presentValue = 0.0  # type: ignore
                 LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
             else:
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
-                self._set_pv_no_cov(obj, bool(val))
+                obj.presentValue = bool(val)  # type: ignore
                 LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
         LOG.debug("Mappings count: %d", len(self.mappings))
@@ -773,25 +758,24 @@ class Server:
             # --- GUARD setzen: diese Änderung stammt aus HA ---
             self._set_inbound_from_ha(obj, True)
             try:
-                # in BACnet-Objekt schreiben (ohne COV)
+                # in BACnet-Objekt schreiben (normal setzen, damit Typen passen)
                 if m.object_type == "analogValue":
                     try:
                         if val in (None, "", "unknown", "unavailable"):
-                            self._set_pv_no_cov(obj, 0.0)
+                            obj.presentValue = 0.0  # type: ignore
                         else:
-                            self._set_pv_no_cov(obj, float(val))
+                            obj.presentValue = float(val)  # type: ignore
                     except Exception:
-                        self._set_pv_no_cov(obj, 0.0)
+                        obj.presentValue = 0.0  # type: ignore
                 else:  # binaryValue
-                    self._set_pv_no_cov(obj, str(val).lower() in (
+                    obj.presentValue = str(val).lower() in (
                         "on", "true", "1", "open", "heat", "cool"
-                    ))
+                    )  # type: ignore
             finally:
                 # --- GUARD wieder entfernen ---
                 self._set_inbound_from_ha(obj, False)
 
             LOG.info("HA change -> %s:%s presentValue=%r", m.object_type, m.instance, obj.presentValue)
-            # (optional) COV-Notifications könnten hier gesendet werden.
         except Exception as exc:
             LOG.debug("state_changed handling failed: %s", exc)
 
