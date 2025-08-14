@@ -75,10 +75,7 @@ def configure_bacpypes_debug(level_name: str):
         LOG.setLevel(logging.DEBUG)
 
     logging.getLogger("bacpypes3").setLevel(level)
-    for name in (
-        "bacpypes3.app","bacpypes3.comm","bacpypes3.pdu","bacpypes3.apdu",
-        "bacpypes3.netservice","bacpypes3.service","bacpypes3.local",
-    ):
+    for name in ("__main__"):
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
