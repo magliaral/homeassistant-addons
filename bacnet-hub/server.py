@@ -144,8 +144,8 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
 
     # device fallbacks
     dev = config.get("device", {}) or {}
-    if "--instance" not in argv and "-i" not in argv and dev.get("device_id"):
-        argv.extend(["--instance", str(int(dev["device_id"]))])
+    if dev.get("instance"):
+        argv.extend(["--instance", str(int(dev["instance"]))])
     if dev.get("address"):
         argv.extend(["--address", str(dev["address"])])
     if dev.get("port"):
