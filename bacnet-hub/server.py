@@ -560,7 +560,8 @@ class Server:
 
         bind_addr = getattr(args, "address", None) or "0.0.0.0"
         bind_port = getattr(args, "port", None) or 47808
-        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, self.cfg_device.get("device_id"))
+        bind_instance = getattr(args, "instance", None) or 47808
+        LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, bind_instance)
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
         if self.device:
             LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
