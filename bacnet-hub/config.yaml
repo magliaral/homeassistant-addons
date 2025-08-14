@@ -21,4 +21,4 @@ options:
 schema:
   ha_url: str
   long_lived_token: str
-  bacpypes_log_level: list(debug|info|warning|error)?
+  Logging: list(debug|info|warning|error)?
