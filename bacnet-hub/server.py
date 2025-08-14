@@ -13,26 +13,44 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 # -----------------------------------------------------------
-# Grund-Logging
+# Logging (optimiert)
 # -----------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logging.Formatter.converter = time.localtime
+
+def _str_to_level(name: str, default: int = logging.INFO) -> int:
+    try:
+        lvl = getattr(logging, str(name or "").upper())
+        if isinstance(lvl, int):
+            return lvl
+    except Exception:
+        pass
+    return default
+
+
+def init_logging(default_level: str = "INFO") -> None:
+    """Initialize root logging once, keep it idempotent, tame noisy libs, pipe warnings."""
+    if not logging.getLogger().handlers:  # avoid duplicate handlers when imported
+        logging.basicConfig(
+            level=_str_to_level(os.getenv("LOG_LEVEL", default_level)),
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        logging.Formatter.converter = time.localtime
+
+    # Quiet down chatty libraries by default; raise if needed later
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    # Route Python warnings to logging
+    logging.captureWarnings(True)
+
+
+init_logging(default_level="INFO")
 LOG = logging.getLogger("bacnet_hub_addon")
 
-async def _periodic_info_heartbeat(logger: logging.Logger, interval_s: int = 600):
-    while True:
-        logger.info("heartbeat: service alive")
-        try:
-            await asyncio.sleep(interval_s)
-        except asyncio.CancelledError:
-            break
 
 # -----------------------------------------------------------
 # Add-on-Optionen
 # -----------------------------------------------------------
+
 def load_addon_options() -> Dict[str, Any]:
     try:
         with open("/data/options.json", "r", encoding="utf-8") as f:
@@ -40,47 +58,60 @@ def load_addon_options() -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 OPTS = load_addon_options()
+
+# Optionales globales Root-Log-Level aus den Add-on-Optionen
+_root_level_name = (OPTS.get("log_level") or os.getenv("LOG_LEVEL") or "INFO")
+logging.getLogger().setLevel(_str_to_level(_root_level_name, logging.INFO))
+
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
+
 
 # -----------------------------------------------------------
 # bacpypes3 Debugging (ModuleLogger + Decorator)
 # -----------------------------------------------------------
 try:
     from bacpypes3.debugging import bacpypes_debugging, ModuleLogger  # type: ignore
-except Exception:
+except Exception:  # Fallbacks, wenn bacpypes3.debugging nicht verfügbar ist
     def bacpypes_debugging(cls):  # no-op
         return cls
-    class ModuleLogger:
-        def __init__(self, _): pass
-        def __getattr__(self, _): return lambda *a, **k: None
+
+    class ModuleLogger:  # type: ignore
+        def __init__(self, _):
+            pass
+
+        def __getattr__(self, _):
+            return lambda *a, **k: None
+
 
 _debug = 0
 _log = ModuleLogger(globals())
 
-def configure_bacpypes_debug(level_name: str):
+
+def configure_bacpypes_debug(level_name: str) -> None:
     level_map = {
-        "debug": logging.DEBUG, "info": logging.INFO,
-        "warning": logging.WARNING, "error": logging.ERROR,
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
     }
     level = level_map.get((level_name or "info").lower(), logging.INFO)
 
-    # ModuleLogger-Ausgaben sichtbar machen
-    if level == logging.DEBUG:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logging.getLogger("__main__").setLevel(logging.DEBUG)
-        logging.getLogger(__name__).setLevel(logging.DEBUG)
-        LOG.setLevel(logging.DEBUG)
-
+    # Nur bacpypes-spezifische Logger explizit setzen
     logging.getLogger("bacpypes3").setLevel(level)
-    for name in ("__main__"):
+
+    # Eigene Hauptlogger optional angleichen (kein Root-Spam)
+    for name in ("__main__", "bacnet_hub_addon"):  # Bugfix: echtes Tuple, kein String-Iter
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
 
+
 configure_bacpypes_debug(BACPYPES_LOG_LEVEL)
+
 
 # -----------------------------------------------------------
 # Helpers
@@ -89,6 +120,7 @@ async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
     return x
+
 
 def dump_obj_debug(prefix: str, obj) -> None:
     try:
@@ -101,12 +133,14 @@ def dump_obj_debug(prefix: str, obj) -> None:
     except Exception as exc:
         LOG.debug("%s dump failed: %s", prefix, exc)
 
+
 # -----------------------------------------------------------
 # YAML laden und argv/Parser für BACpypes bauen
 # -----------------------------------------------------------
 DEFAULT_CFG_DIR = "/config/bacnet-hub"
 DEFAULT_CONFIG_PATH = f"{DEFAULT_CFG_DIR}/mappings.yaml"
 DEFAULT_BACPY_YAML_PATH = f"{DEFAULT_CFG_DIR}/bacpypes.yml"
+
 
 def _load_yaml(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
@@ -117,6 +151,7 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     except Exception as err:
         LOG.warning("Fehler beim Laden von YAML %s: %r", path, err)
         return {}
+
 
 def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
     argv: List[str] = []
@@ -133,6 +168,7 @@ def _bacpypes_dict_to_argv(options: Dict[str, Any]) -> List[str]:
         else:
             argv.extend([flag, str(value)])
     return argv
+
 
 def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     argv: List[str] = []
@@ -154,6 +190,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
     if _debug:
         LOG.debug("Finale argv aus YAML: %r", argv)
     return argv
+
 
 # -----------------------------------------------------------
 # Home Assistant WebSocket Client
@@ -179,6 +216,7 @@ class HAWS:
 
     async def connect(self):
         import websockets
+
         self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
         first = json.loads(await self.ws.recv())
         if first.get("type") == "auth_required":
@@ -209,9 +247,9 @@ class HAWS:
     async def subscribe_state_changes(self, on_event):
         sub_id = self._id
         self._id += 1
-        await self.ws.send(json.dumps(
-            {"id": sub_id, "type": "subscribe_events", "event_type": "state_changed"}
-        ))
+        await self.ws.send(
+            json.dumps({"id": sub_id, "type": "subscribe_events", "event_type": "state_changed"})
+        )
 
         async def _loop():
             while True:
@@ -235,12 +273,13 @@ class HAWS:
                 return float(val)
             except Exception:
                 return 0.0
-        return str(val).lower() in ("on","true","1","open","heat","cool")
+        return str(val).lower() in ("on", "true", "1", "open", "heat", "cool")
 
     async def call_service(self, domain: str, service: str, data: Dict[str, Any]):
         res = await self.call({"type": "call_service", "domain": domain, "service": service, "service_data": data})
         if not res.get("success", True):
             LOG.warning("Service call failed: %s", res)
+
 
 # -----------------------------------------------------------
 # Mapping / Objektdefinition
@@ -248,23 +287,27 @@ class HAWS:
 @dataclass
 class Mapping:
     entity_id: str
-    object_type: str        # analogValue | binaryValue
+    object_type: str  # analogValue | binaryValue
     instance: int
     units: Optional[str] = None
     writable: bool = False
-    mode: str = "state"     # state | attr
+    mode: str = "state"  # state | attr
     attr: Optional[str] = None
     name: Optional[str] = None
     write: Optional[Dict[str, Any]] = None
 
+
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
-SUPPORTED_TYPES = {"analogValue","binaryValue"}
+SUPPORTED_TYPES = {"analogValue", "binaryValue"}
+
 
 # -----------------------------------------------------------
 # BACpypes Imports (lazy)
 # -----------------------------------------------------------
+
 def import_bacpypes():
     from importlib import import_module
+
     _Application = import_module("bacpypes3.app").Application
     _SimpleArgumentParser = import_module("bacpypes3.argparse").SimpleArgumentParser
     _YAMLArgumentParser = import_module("bacpypes3.argparse").YAMLArgumentParser
@@ -282,14 +325,17 @@ def import_bacpypes():
     ]:
         try:
             m = import_module(mod)
-            if av and hasattr(m, av): AV = getattr(m, av)
-            if bv and hasattr(m, bv): BV = getattr(m, bv)
+            if av and hasattr(m, av):
+                AV = getattr(m, av)
+            if bv and hasattr(m, bv):
+                BV = getattr(m, bv)
         except Exception:
             pass
     if not AV or not BV:
         raise ImportError("AnalogValueObject/BinaryValueObject not found")
 
     return _Application, _SimpleArgumentParser, _YAMLArgumentParser, _DeviceObject, AV, BV, _Unsigned, _Address
+
 
 # -----------------------------------------------------------
 # Server
@@ -366,9 +412,9 @@ class Server:
                 return 0.0
         else:
             s = str(getattr(raw_value, "value", raw_value)).lower()
-            if s in ("1","true","on","active","open","heat","cool"):
+            if s in ("1", "true", "on", "active", "open", "heat", "cool"):
                 return True
-            if s in ("0","false","off","inactive","closed"):
+            if s in ("0", "false", "off", "inactive", "closed"):
                 return False
             return "active" in s or s == "1"
 
@@ -399,6 +445,7 @@ class Server:
 
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
+
                 async def dyn_read(prop, arrayIndex=None):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
@@ -408,10 +455,12 @@ class Server:
                         except Exception:
                             obj.presentValue = 0.0  # type: ignore
                     return await maybe_await(orig(prop, arrayIndex))
+
                 obj.ReadProperty = dyn_read  # type: ignore
 
             if hasattr(obj, "WriteProperty"):
                 origw = obj.WriteProperty
+
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     # 1) Originalen Write ausführen (damit PV/Prio-Logik korrekt ist)
@@ -426,6 +475,7 @@ class Server:
                             asyncio.create_task(self._write_to_ha(m, num))
 
                     return result
+
                 obj.WriteProperty = dyn_write  # type: ignore
 
         else:  # binaryValue
@@ -433,16 +483,19 @@ class Server:
 
             if hasattr(obj, "ReadProperty"):
                 orig = obj.ReadProperty
+
                 async def dyn_read(prop, arrayIndex=None):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
                     if pid == "presentValue" and self.ha:
                         val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
                         obj.presentValue = bool(val)  # type: ignore
                     return await maybe_await(orig(prop, arrayIndex))
+
                 obj.ReadProperty = dyn_read  # type: ignore
 
             if hasattr(obj, "WriteProperty"):
                 origw = obj.WriteProperty
+
                 async def dyn_write(prop, value, arrayIndex=None, priority=None, direct=False):
                     pid = getattr(prop, "propertyIdentifier", str(prop))
 
@@ -458,6 +511,7 @@ class Server:
                             asyncio.create_task(self._write_to_ha(m, on))
 
                     return result
+
                 obj.WriteProperty = dyn_write  # type: ignore
 
         await maybe_await(app.add_object(obj))
@@ -533,7 +587,16 @@ class Server:
         await self.ha.prime_states()
 
         # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
-        Application, SimpleArgumentParser, YAMLArgumentParser, DeviceObject, AV, BV, Unsigned, Address = import_bacpypes()
+        (
+            Application,
+            SimpleArgumentParser,
+            YAMLArgumentParser,
+            DeviceObject,
+            AV,
+            BV,
+            Unsigned,
+            Address,
+        ) = import_bacpypes()
         args = self.build_bacpypes_args(YAMLArgumentParser, SimpleArgumentParser)
 
         # 4) Application starten (wie in deinem funktionierenden Beispiel)
@@ -553,6 +616,7 @@ class Server:
         if _debug:
             try:
                 from bacpypes3.settings import settings as bp_settings
+
                 LOG.debug("args: %r", vars(args))
                 LOG.debug("settings: %s", dict(bp_settings))
             except Exception:
@@ -564,13 +628,15 @@ class Server:
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, bind_instance)
         LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
         if self.device:
-            LOG.debug("local_device: %r", self.device); dump_obj_debug("local_device contents:", self.device)
+            LOG.debug("local_device: %r", self.device)
+            dump_obj_debug("local_device contents:", self.device)
         LOG.debug("app: %r", self.app)
 
         # 5) Objekte anlegen
         for m in self.mappings:
             if m.object_type not in SUPPORTED_TYPES:
-                LOG.warning("Unsupported type %s", m.object_type); continue
+                LOG.warning("Unsupported type %s", m.object_type)
+                continue
             await self._add_object(self.app, m, AV, BV)
 
         # 6) **Initiale Synchronisierung**
@@ -614,7 +680,14 @@ class Server:
                     except Exception:
                         obj.presentValue = 0.0  # type: ignore
                 else:  # binaryValue
-                    obj.presentValue = str(val).lower() in ("on","true","1","open","heat","cool")  # type: ignore
+                    obj.presentValue = str(val).lower() in (
+                        "on",
+                        "true",
+                        "1",
+                        "open",
+                        "heat",
+                        "cool",
+                    )  # type: ignore
             finally:
                 # --- GUARD wieder entfernen ---
                 self._set_inbound_from_ha(obj, False)
@@ -636,6 +709,7 @@ class Server:
                     res = close()
                     if inspect.isawaitable(res):
                         await res
+
 
 # -----------------------------------------------------------
 # Main
