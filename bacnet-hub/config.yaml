@@ -15,28 +15,10 @@ init: false
 map:
   - config:rw
 options:
-  ha_url: "ws://supervisor/core/websocket"
-  long_lived_token: ""
+  ha_url: "ws://supervisor/core/websocket"   # Standard: Supervisor-Proxy
+  long_lived_token: ""                       # Fallback (leer lassen, wenn Supervisor-Token klappt)
   bacpypes_log_level: "info"
-  bacpypes:
-    debug:
-      - "__name__"
-    color: "true"
-    options:
-      instance: 3600
-      address: "192.168.31.36/24"
-      name: "BACnet Hub"
-      no_who_is: false
 schema:
   ha_url: str
   long_lived_token: str
   bacpypes_log_level: list(debug|info|warning|error)?
-  bacpypes:
-    debug:
-      - str
-    color: str
-    options:
-      instance: int
-      address: str
-      name: str
-      no_who_is: bool
