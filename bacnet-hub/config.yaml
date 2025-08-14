@@ -1,5 +1,5 @@
 name: BACnet Hub
-version: "0.1.0"
+version: "0.2.0"
 slug: bacnet-hub
 description: Enables seamless integration between Home Assistant and BACnet/IP.
 arch:
