@@ -43,7 +43,7 @@ def load_addon_options() -> Dict[str, Any]:
 OPTS = load_addon_options()
 HA_URL = os.getenv("HA_WS_URL", OPTS.get("ha_url") or "ws://supervisor/core/websocket")
 LLAT = (OPTS.get("long_lived_token") or "").strip() or None
-BACPYPES_LOG_LEVEL = (OPTS.get("Debug Log Levels") or "info").lower()
+BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
 
 # -----------------------------------------------------------
 # bacpypes3 Debugging (ModuleLogger + Decorator)
