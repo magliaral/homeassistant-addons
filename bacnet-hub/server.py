@@ -105,7 +105,7 @@ def configure_bacpypes_debug(level_name: str) -> None:
     logging.getLogger("bacpypes3").setLevel(level)
 
     # Eigene Hauptlogger optional angleichen (kein Root-Spam)
-    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app", "bacpypes3.pdu"):  # Bugfix: echtes Tuple, kein String-Iter
+    for name in ("__main__", "bacnet_hub_addon", "bacpypes3.app"):  # Bugfix: echtes Tuple, kein String-Iter
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
@@ -194,7 +194,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------------------------------------
-# Home Assistant WebSocket Client
+# Home Assistant WebSocket Client (mit Single-Reader & Pending-Futures)
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
@@ -214,6 +214,10 @@ class HAWS:
         self.ws = None
         self._id = 1
         self.state_cache: Dict[str, Dict[str, Any]] = {}
+        self._pending: Dict[int, asyncio.Future] = {}
+        self._reader_task: Optional[asyncio.Task] = None
+        self._send_lock = asyncio.Lock()
+        self._on_event = None  # set by subscribe_state_changes
 
     async def connect(self):
         import websockets
@@ -227,17 +231,66 @@ class HAWS:
                 raise RuntimeError(f"WS auth failed: {ok}")
         LOG.info("HA WebSocket connected")
 
+        # Start single reader
+        self._reader_task = asyncio.create_task(self._reader())
+
+    async def _reader(self):
+        """Single consumer of ws.recv(); routes replies and events."""
+        assert self.ws is not None
+        try:
+            while True:
+                raw = await self.ws.recv()
+                msg = json.loads(raw)
+
+                # Response to a call()?
+                msg_id = msg.get("id")
+                if msg_id is not None and msg_id in self._pending:
+                    fut = self._pending.pop(msg_id)
+                    if not fut.done():
+                        fut.set_result(msg)
+                    continue
+
+                # Events (state_changed)
+                if msg.get("type") == "event":
+                    evt = msg.get("event") or {}
+                    if evt.get("event_type") == "state_changed":
+                        data = evt.get("data") or {}
+                        ent_id = data.get("entity_id")
+                        if ent_id:
+                            self.state_cache[ent_id] = data.get("new_state") or {}
+                        if self._on_event:
+                            # do not block the reader
+                            asyncio.create_task(self._on_event(data))
+                    continue
+
+                # Unknown/unhandled – debug only
+                # LOG.debug("WS unhandled msg: %s", msg)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            LOG.warning("HA WS reader stopped: %r", e)
+
     async def call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Send request and await its response via the single reader."""
         if not self.ws:
             raise RuntimeError("WS not connected")
-        payload = dict(payload)
-        payload.setdefault("id", self._id)
+
+        # allocate id & future
+        req = dict(payload)
+        req.setdefault("id", self._id)
         self._id += 1
-        await self.ws.send(json.dumps(payload))
-        while True:
-            msg = json.loads(await self.ws.recv())
-            if msg.get("id") == payload["id"]:
-                return msg
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req["id"]] = fut
+
+        # send serialized
+        async with self._send_lock:
+            await self.ws.send(json.dumps(req))
+
+        # await response from _reader
+        msg = await fut
+        return msg
 
     async def prime_states(self):
         res = await self.call({"type": "get_states"})
@@ -246,23 +299,9 @@ class HAWS:
             self.state_cache[s["entity_id"]] = s
 
     async def subscribe_state_changes(self, on_event):
-        sub_id = self._id
-        self._id += 1
-        await self.ws.send(
-            json.dumps({"id": sub_id, "type": "subscribe_events", "event_type": "state_changed"})
-        )
-
-        async def _loop():
-            while True:
-                raw = await self.ws.recv()
-                evt = json.loads(raw)
-                if evt.get("type") == "event" and evt.get("event", {}).get("event_type") == "state_changed":
-                    data = evt["event"]["data"]
-                    ent_id = data["entity_id"]
-                    self.state_cache[ent_id] = data.get("new_state") or {}
-                    await on_event(data)
-
-        asyncio.create_task(_loop())
+        """Register callback and send subscribe request (no extra recv loop!)."""
+        self._on_event = on_event
+        await self.call({"type": "subscribe_events", "event_type": "state_changed"})
 
     def get_value(self, entity_id: str, mode="state", attr: Optional[str] = None, analog=False):
         st = self.state_cache.get(entity_id)
@@ -688,7 +727,7 @@ class Server:
         # 6) **Initiale Synchronisierung**
         await self._initial_sync()
 
-        # 7) Live-Events abonnieren
+        # 7) Live-Events abonnieren (nur Request senden; Reader empfängt)
         await self.ha.subscribe_state_changes(self._on_state_changed)
 
     async def _on_state_changed(self, data: Dict[str, Any]):
