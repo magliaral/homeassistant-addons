@@ -314,7 +314,7 @@ class Server:
         dev = cfg.get("options", {}) or {}
         objs = cfg.get("objects", []) or []
         self.cfg_device = {
-            "device_id": int(dev.get("instance", 500000)),
+            "instance": int(dev.get("instance", 500000)),
             "name": dev.get("name") or "BACnet Hub",
         }
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
