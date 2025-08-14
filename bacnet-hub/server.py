@@ -6,11 +6,11 @@ import io
 import json
 import logging
 import os
+import random
 import tempfile
 import time
 import yaml
 import types
-import contextlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -195,7 +195,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------------------------------------
-# Home Assistant WebSocket Client (Single-Reader + Pending-Futures)
+# Home Assistant WebSocket Client (Single-Reader + Retry + Pending-Futures)
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
@@ -220,75 +220,51 @@ class HAWS:
         self._send_lock = asyncio.Lock()
         self._on_event = None  # set by subscribe_state_changes
 
-    # -------- robuste Statusprüfung (versionssicher) --------
-    def is_open(self) -> bool:
-        """
-        Robust check if the websocket is open across websockets versions.
-        Avoids accessing non-existent attributes like `.closed`.
-        """
-        ws = self.ws
-        if not ws:
-            return False
-        try:
-            st = getattr(ws, "state", None)
-            if st is not None:
-                name = getattr(st, "name", None)
-                if name:
-                    return name.upper() == "OPEN"
-                return int(st) == 1  # OPEN == 1 in einigen Versionen
-        except Exception:
-            pass
-        return bool(getattr(ws, "open", False))
-
-    async def connect(self):
-        import websockets
-
-        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
-        first = json.loads(await self.ws.recv())
-        if first.get("type") == "auth_required":
-            await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
-            ok = json.loads(await self.ws.recv())
-            if ok.get("type") != "auth_ok":
-                raise RuntimeError(f"WS auth failed: {ok}")
-        LOG.info("HA WebSocket connected")
-
-        # Start single reader
+    async def _start_reader(self):
+        if self._reader_task and not self._reader_task.done():
+            return
         self._reader_task = asyncio.create_task(self._reader())
 
-    async def connect_with_retry(self, max_attempts: int = 0) -> None:
-        """
-        Connect to HA with exponential backoff (mit Jitter).
-        max_attempts=0 => unendlich oft versuchen (empfohlen beim Supervisor-Start).
-        """
+    async def connect_once(self):
+        """One-shot connect + auth. Raise on failure."""
         import websockets
-        import random
+        try:
+            self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=20)
+            first = json.loads(await self.ws.recv())
+            if first.get("type") == "auth_required":
+                await self.ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+                ok = json.loads(await self.ws.recv())
+                if ok.get("type") != "auth_ok":
+                    raise RuntimeError(f"WS auth failed: {ok}")
+            LOG.info("HA WebSocket connected")
+            await self._start_reader()
+        except Exception as e:
+            # kompatibel mit alten/neuen websockets-Versionen, keine speziellen Typen voraussetzen
+            raise RuntimeError(f"HA WS connect/auth failed: {e!r}") from e
 
+    async def connect_with_retry(self, max_attempts: int = 30, base_delay: float = 1.0, max_delay: float = 10.0):
+        """Connect with exponential backoff + jitter. Never throws after last attempt: keeps trying."""
         attempt = 0
-        base = 1.0
         while True:
             attempt += 1
             try:
-                await self.connect()
-                # Validierung: States laden (stellt sicher, dass der Socket wirklich nutzbar ist)
-                await self.prime_states()
-                LOG.info("HA WebSocket ready (states primed, attempt %d)", attempt)
+                await self.connect_once()
+                # kleines Ping an Core: get_config (robuster als gleich get_states)
+                try:
+                    await self.call({"type": "get_config"})
+                except Exception as e:
+                    LOG.warning("probe get_config failed (attempt %d): %r", attempt, e)
                 return
-            except (asyncio.TimeoutError, ConnectionError, OSError, Exception) as e:
-                if 0 < max_attempts < attempt:
-                    LOG.error("HA WebSocket: gebe nach %d Versuchen auf: %r", attempt - 1, e)
-                    raise
-                # Backoff mit Jitter
-                delay = min(30.0, base * (2 ** (attempt - 1)))  # 1,2,4,8,16,30...
-                delay *= (0.7 + 0.6 * random.random())
+            except Exception as e:
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
                 LOG.warning(
-                    "HA nicht bereit oder WS-Connect fehlgeschlagen (Versuch %d): %r → retry in %.1fs",
+                    "HA not ready or WS connect failed (attempt %d): %r → retry in %.1fs",
                     attempt, e, delay
                 )
-                with contextlib.suppress(Exception):
-                    if self.ws:
-                        await self.ws.close()
-                self.ws = None
                 await asyncio.sleep(delay)
+                if attempt >= max_attempts:
+                    # weiter versuchen, aber Delay am oberen Limit halten
+                    attempt = max_attempts - 1  # cap the growth
 
     async def _reader(self):
         """Single consumer of ws.recv(); routes replies and events."""
@@ -298,7 +274,7 @@ class HAWS:
                 raw = await self.ws.recv()
                 msg = json.loads(raw)
 
-                # Response zu call()?
+                # Response to a call()?
                 msg_id = msg.get("id")
                 if msg_id is not None and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
@@ -315,7 +291,7 @@ class HAWS:
                         if ent_id:
                             self.state_cache[ent_id] = data.get("new_state") or {}
                         if self._on_event:
-                            # Reader nicht blockieren
+                            # do not block the reader
                             asyncio.create_task(self._on_event(data))
                     continue
 
@@ -329,7 +305,7 @@ class HAWS:
         if not self.ws:
             raise RuntimeError("WS not connected")
 
-        # ID & Future anlegen
+        # allocate id & future
         req = dict(payload)
         req.setdefault("id", self._id)
         self._id += 1
@@ -337,11 +313,11 @@ class HAWS:
         fut: asyncio.Future = loop.create_future()
         self._pending[req["id"]] = fut
 
-        # Senden (serialisiert)
+        # send serialized
         async with self._send_lock:
             await self.ws.send(json.dumps(req))
 
-        # Antwort vom Reader abwarten
+        # await response from _reader
         msg = await fut
         return msg
 
@@ -352,7 +328,7 @@ class HAWS:
             self.state_cache[s["entity_id"]] = s
 
     async def subscribe_state_changes(self, on_event):
-        """Register callback and send subscribe request (kein extra recv-loop)."""
+        """Register callback and send subscribe request (no extra recv loop!)."""
         self._on_event = on_event
         await self.call({"type": "subscribe_events", "event_type": "state_changed"})
 
@@ -384,10 +360,13 @@ class Mapping:
     instance: int
     units: Optional[str] = None
     writable: bool = False
-    mode: str = "state"  # state | attr
+    mode: str = "state"         # state | attr
     attr: Optional[str] = None
     name: Optional[str] = None
     write: Optional[Dict[str, Any]] = None
+    # Value-Maps: HA <-> BACnet
+    read_value_map: Optional[Dict[Any, Any]] = None   # HA -> BACnet
+    write_value_map: Optional[Dict[Any, Any]] = None  # BACnet -> HA
 
 
 ENGINEERING_UNITS_ENUM = {"degreesCelsius": 62, "percent": 98, "noUnits": 95}
@@ -545,6 +524,30 @@ class Server:
         object.__setattr__(obj, "_ha_inbound_guard", bool(flag))
 
     # ----------------------------
+    # Value-Mapping helpers
+    # ----------------------------
+    @staticmethod
+    def _normalize_key_for_map(key: Any) -> Any:
+        # robust: bool->"true"/"false"; ints/floats bleiben; strings lower
+        if isinstance(key, bool):
+            return "true" if key else "false"
+        if isinstance(key, str):
+            return key.strip()
+        return key
+
+    def _apply_write_map(self, m: Mapping, value: Any) -> Any:
+        if not (m and m.write_value_map):
+            return value
+        k = self._normalize_key_for_map(value)
+        return m.write_value_map.get(k, m.write_value_map.get(str(k), value))
+
+    def _apply_read_map(self, m: Mapping, value: Any) -> Any:
+        if not (m and m.read_value_map):
+            return value
+        k = self._normalize_key_for_map(value)
+        return m.read_value_map.get(k, m.read_value_map.get(str(k), value))
+
+    # ----------------------------
     # Wrapper-Fabriken für Read/Write (unterstützt CamelCase + snake_case)
     # ----------------------------
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
@@ -596,6 +599,7 @@ class Server:
 
                 pv_after = getattr(obj, "presentValue", None)
                 coerced = self._coerce_for_ha(m, pv_after)
+
                 LOG.info(
                     "[WRITE] BACnet change detected → %s:%s (%s) | Property=%s | PV(after)=%s → Sync to HA",
                     m.object_type, m.instance, m.entity_id, pid_raw, coerced
@@ -624,15 +628,20 @@ class Server:
             if pid == "presentvalue" and self.ha:
                 if m.object_type == "analogValue":
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
+                    mapped = self._apply_read_map(m, val)
                     try:
-                        obj.presentValue = float(val or 0.0)  # type: ignore
+                        obj.presentValue = float(mapped if mapped is not None else 0.0)  # type: ignore
                         LOG.debug("[READ] Updated analogValue from HA → %s", obj.presentValue)
                     except Exception as e:
-                        LOG.warning("[READ] Could not convert HA value '%s' to float (%s)", val, e)
+                        LOG.warning("[READ] Could not convert HA value '%s' (mapped '%s') to float (%s)", val, mapped, e)
                         obj.presentValue = 0.0  # type: ignore
                 else:
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                    obj.presentValue = bool(val)  # type: ignore
+                    mapped = self._apply_read_map(m, val)
+                    if isinstance(mapped, bool):
+                        obj.presentValue = mapped  # type: ignore
+                    else:
+                        obj.presentValue = str(mapped).lower() in ("on", "true", "1", "open", "heat", "cool")  # type: ignore
                     LOG.debug("[READ] Updated binaryValue from HA → %s", obj.presentValue)
 
             result = await maybe_await(orig_read(*args, **kwargs))
@@ -724,7 +733,7 @@ class Server:
 
         svc = m.write["service"]
 
-        # Kurzform: turn_on_off (light/switch etc.)
+        # Kurzform: turn_on_off (light/switch etc.) – Mapping hier NICHT anwenden
         if svc.endswith(".turn_on_off"):
             domain = svc.split(".", 1)[0]
             name = "turn_on" if bool(value) else "turn_off"
@@ -733,14 +742,16 @@ class Server:
             await self.ha.call_service(domain, name, data)
             return
 
-        # generischer Service
+        # generischer Service – hier Mapping anwenden (z.B. hvac_mode, fan_mode, ...)
         if "." in svc:
             domain, service = svc.split(".", 1)
             data = {"entity_id": m.entity_id}
 
             payload_key = m.write.get("payload_key")
+            mapped_value = value
             if payload_key is not None:
-                data[payload_key] = value
+                mapped_value = self._apply_write_map(m, value)
+                data[payload_key] = mapped_value
 
             extra = m.write.get("extra")
             if isinstance(extra, dict):
@@ -766,14 +777,19 @@ class Server:
 
             if m.object_type == "analogValue":
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
+                mapped = self._apply_read_map(m, val)
                 try:
-                    obj.presentValue = float(val or 0.0)  # type: ignore
+                    obj.presentValue = float(mapped if mapped is not None else 0.0)  # type: ignore
                 except Exception:
                     obj.presentValue = 0.0  # type: ignore
                 LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
             else:
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
-                obj.presentValue = bool(val)  # type: ignore
+                mapped = self._apply_read_map(m, val)
+                if isinstance(mapped, bool):
+                    obj.presentValue = mapped  # type: ignore
+                else:
+                    obj.presentValue = str(mapped).lower() in ("on", "true", "1", "open", "heat", "cool")  # type: ignore
                 LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
         LOG.debug("Mappings count: %d", len(self.mappings))
@@ -786,9 +802,10 @@ class Server:
         # 1) YAML laden
         self.load_config()
 
-        # 2) HA verbinden (robust, mit Retry bis HA bereit)
+        # 2) HA verbinden (robust)
         self.ha = HAWS()
-        await self.ha.connect_with_retry(max_attempts=0)
+        await self.ha.connect_with_retry()
+        await self.ha.prime_states()
 
         # 3) BACpypes importieren und Parser/Args erstellen (YAMLArgumentParser bevorzugt)
         (
@@ -868,19 +885,25 @@ class Server:
             # --- GUARD setzen: diese Änderung stammt aus HA ---
             self._set_inbound_from_ha(obj, True)
             try:
+                # Mapping anwenden
+                mapped = self._apply_read_map(m, val)
+
                 # in BACnet-Objekt schreiben (normal setzen, damit Typen passen)
                 if m.object_type == "analogValue":
                     try:
-                        if val in (None, "", "unknown", "unavailable"):
+                        if mapped in (None, "", "unknown", "unavailable"):
                             obj.presentValue = 0.0  # type: ignore
                         else:
-                            obj.presentValue = float(val)  # type: ignore
+                            obj.presentValue = float(mapped)  # type: ignore
                     except Exception:
                         obj.presentValue = 0.0  # type: ignore
                 else:  # binaryValue
-                    obj.presentValue = str(val).lower() in (
-                        "on", "true", "1", "open", "heat", "cool"
-                    )  # type: ignore
+                    if isinstance(mapped, bool):
+                        obj.presentValue = mapped  # type: ignore
+                    else:
+                        obj.presentValue = str(mapped).lower() in (
+                            "on", "true", "1", "open", "heat", "cool"
+                        )  # type: ignore
             finally:
                 # --- GUARD wieder entfernen ---
                 self._set_inbound_from_ha(obj, False)
