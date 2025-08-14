@@ -11,6 +11,10 @@ import time
 import yaml
 from typing import Any, Dict, List
 
+# some debugging
+_debug = 0
+_log = ModuleLogger(globals())
+
 # -----------------------------------------------------------
 # Grund-Logging
 # -----------------------------------------------------------
@@ -42,34 +46,6 @@ def load_addon_options() -> Dict[str, Any]:
 OPTS = load_addon_options()
 BACPYPES_LOG_LEVEL = (OPTS.get("bacpypes_log_level") or "info").lower()
 BAC_DEBUG_MODULES: List[str] = OPTS.get("bacpypes_debug_modules") or []  # optional liste
-
-# -----------------------------------------------------------
-# BACpypes-Settings VOR allen bacpypes3-Imports setzen
-# -----------------------------------------------------------
-try:
-    from bacpypes3.settings import settings as bp_settings  # nur settings importieren
-    # „Alles an“, wenn Log-Level 'debug' ist:
-    debug_list = list(BAC_DEBUG_MODULES)  # user-spezifische Module zuerst
-    if BACPYPES_LOG_LEVEL == "debug":
-        # Paket-Root aktiviert sämtliche Unterlogger
-        if "bacpypes3" not in debug_list:
-            debug_list.insert(0, "bacpypes3")
-        # optional auch dein Hauptmodul
-        if "__main__" not in debug_list:
-            debug_list.append("__main__")
-
-    if debug_list:
-        bp_settings["debug"] = debug_list
-
-    # optionale Quality-of-life Flags (analog CLI)
-    if "color" not in bp_settings:
-        bp_settings["color"] = False
-    if "route_aware" not in bp_settings:
-        bp_settings["route_aware"] = False
-
-    LOG.info("preset bacpypes debug modules: %s", bp_settings.get("debug"))
-except Exception as e:
-    LOG.warning("could not preset bacpypes settings early: %s", e)
 
 # -----------------------------------------------------------
 # Hilfen
