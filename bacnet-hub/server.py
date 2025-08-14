@@ -311,7 +311,7 @@ class Server:
     def load_config(self) -> None:
         cfg = _load_yaml(self.cfg_path)
         self.cfg_all = cfg
-        dev = cfg.get("device", {}) or {}
+        dev = cfg.get("options", {}) or {}
         objs = cfg.get("objects", []) or []
         self.cfg_device = {
             "device_id": int(dev.get("device_id", 500000)),
