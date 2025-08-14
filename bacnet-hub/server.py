@@ -104,13 +104,57 @@ def configure_bacpypes_debug(level_name: str) -> None:
     logging.getLogger("bacpypes3").setLevel(level)
 
     # Eigene Hauptlogger optional angleichen (kein Root-Spam)
-    for name in ("__main__", "bacnet_hub_addon", "bacpypes3"):  # Bugfix: echtes Tuple, kein String-Iter
+    for name in ("__main__", "bacnet_hub_addon"):  # Bugfix: echtes Tuple, kein String-Iter
         logging.getLogger(name).setLevel(level)
 
     LOG.info("bacpypes3 logger level set to '%s'", level_name)
 
 
+def enable_all_bacpypes3_debug() -> int:
+    """Aktiviere das interne _debug-Flag in **allen** bacpypes3-Modulen.
+
+    Läuft rekursiv durch das Package und setzt `module._debug = 1`, sodass
+    alle `@bacpypes_debugging`-Dekorator-Logs durchgelassen werden.
+
+    Returns
+    -------
+    int
+        Anzahl der Module, in denen _debug aktiviert wurde.
+    """
+    import importlib
+    import pkgutil
+
+    try:
+        import bacpypes3  # type: ignore
+    except Exception as exc:
+        LOG.warning("bacpypes3 nicht importierbar: %s", exc)
+        return 0
+
+    count = 0
+    for modinfo in pkgutil.walk_packages(bacpypes3.__path__, bacpypes3.__name__ + "."):
+        try:
+            mod = importlib.import_module(modinfo.name)
+            if hasattr(mod, "_debug"):
+                setattr(mod, "_debug", 1)
+                count += 1
+        except Exception as exc:
+            LOG.debug("Debug-Aktivierung fehlgeschlagen für %s: %s", modinfo.name, exc)
+
+    # Sicherheitshalber Logger-Level für das ganze Package auf DEBUG
+    logging.getLogger("bacpypes3").setLevel(logging.DEBUG)
+
+    LOG.info("bacpypes3: _debug in %d Modulen aktiviert", count)
+    return count
+
+
 configure_bacpypes_debug(BACPYPES_LOG_LEVEL)
+
+# Wenn volle Verbose-Ausgabe gewünscht ist, ALLES einschalten
+if BACPYPES_LOG_LEVEL == "debug":
+    try:
+        enable_all_bacpypes3_debug()
+    except Exception as exc:
+        LOG.debug("enable_all_bacpypes3_debug() failed: %s", exc)
 
 
 # -----------------------------------------------------------
@@ -186,6 +230,15 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
         argv.extend(["--address", str(dev["address"])])
     if dev.get("port"):
         argv.extend(["--port", str(int(dev["port"]))])
+
+    # Testweise: bei Debug-Loglevel automatisch --debug-Flags ergänzen,
+    # damit bacpypes3-Dekorator-Logs greifen, falls nicht ohnehin per YAML gesetzt.
+    try:
+        if BACPYPES_LOG_LEVEL == "debug" and "--debug" not in argv:
+            # Hinweis: --debug erwartet Module/Klassen. Wir nehmen ein breites Minimum.
+            argv.extend(["--debug", "bacpypes3", "--debug", "__main__"])
+    except Exception:
+        pass
 
     if _debug:
         LOG.debug("Finale argv aus YAML: %r", argv)
@@ -626,6 +679,11 @@ class Server:
         bind_port = getattr(args, "port", None) or 47808
         bind_instance = getattr(args, "instance", None) or 47808
         LOG.info("BACnet bound to %s:%s device-id=%s", bind_addr, bind_port, bind_instance)
+        LOG.debug("ipv4_address: %r", Address(f"{bind_addr}"))
+        if self.device:
+            LOG.debug("local_device: %r", self.device)
+            dump_obj_debug("local_device contents:", self.device)
+        LOG.debug("app: %r", self.app)
 
         # 5) Objekte anlegen
         for m in self.mappings:
