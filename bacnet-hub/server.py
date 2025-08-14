@@ -320,27 +320,17 @@ class Server:
         self.mappings = [Mapping(**o) for o in objs if isinstance(o, dict)]
 
     def build_bacpypes_args(self, YAMLArgumentParser, SimpleArgumentParser):
-        # 0) Prüfen, ob bacpypes direkt in Add-on-Options steht
-        if OPTS.get("bacpypes"):
-            bp_cfg = OPTS["bacpypes"]
-            if isinstance(bp_cfg, dict):
-                # Temporäre YAML-Datei erstellen, weil YAMLArgumentParser --yaml erwartet
-                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yml") as tf:
-                    yaml.safe_dump(bp_cfg, tf)
-                    temp_path = tf.name
-                parser = YAMLArgumentParser()
-                args = parser.parse_args(["--yaml", temp_path])
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-                return args
-    
+        """
+        Präferenz:
+          1) /config/bacnet_hub/bacpypes.yml
+          2) bacpypes_yaml: {} in mappings.yaml
+          3) Fallback: bacpypes.options/args + device-Felder
+        """
         # 1) eigene bacpypes.yml?
         if os.path.exists(DEFAULT_BACPY_YAML_PATH):
             parser = YAMLArgumentParser()
             return parser.parse_args(["--yaml", DEFAULT_BACPY_YAML_PATH])
-    
+
         # 2) eingebetteter Block in mappings.yaml?
         bp_yaml = self.cfg_all.get("bacpypes_yaml")
         if isinstance(bp_yaml, dict):
@@ -354,8 +344,8 @@ class Server:
             except OSError:
                 pass
             return args
-    
-        # 3) Fallback
+
+        # 3) Fallback: argv bauen
         argv = _build_argv_from_yaml(self.cfg_all)
         parser = SimpleArgumentParser()
         return parser.parse_args(argv)
