@@ -453,6 +453,7 @@ class Server:
     def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
         LOG.debug("_make_write_wrapper")
         async def dyn_write(_self, *args, **kwargs):
+            LOG.debug("BACnet change dyn_write - %s : %s", argsp, kwargs)
             
             # 1) Property-Identifier robust auslesen
             prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
