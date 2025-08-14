@@ -194,7 +194,7 @@ def _build_argv_from_yaml(config: Dict[str, Any]) -> List[str]:
 
 
 # -----------------------------------------------------------
-# Home Assistant WebSocket Client (mit Single-Reader & Pending-Futures)
+# Home Assistant WebSocket Client (Single-Reader + Pending-Futures)
 # -----------------------------------------------------------
 class HAWS:
     def __init__(self):
@@ -416,6 +416,18 @@ class Server:
         # "present-value" / "present_value" / "PresentValue" -> "presentvalue"
         return "".join(ch for ch in str(pid) if ch.isalnum()).lower()
 
+    # --- presentValue ohne COV setzen ---
+    def _set_pv_no_cov(self, obj, value):
+        """presentValue setzen ohne COV-Filter/Arithmetik auszulösen."""
+        try:
+            object.__setattr__(obj, "presentValue", value)
+        except Exception as e:
+            LOG.debug("Fallback PV set: %r", e)
+            try:
+                obj.presentValue = value  # type: ignore
+            except Exception as ee:
+                LOG.debug("PV set failed: %r", ee)
+
     def load_config(self) -> None:
         cfg = _load_yaml(self.cfg_path)
         self.cfg_all = cfg
@@ -533,12 +545,12 @@ class Server:
                 if m.object_type == "analogValue":
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=True)
                     try:
-                        obj.presentValue = float(val or 0.0)  # type: ignore
+                        self._set_pv_no_cov(obj, float(val or 0.0))
                     except Exception:
-                        obj.presentValue = 0.0  # type: ignore
+                        self._set_pv_no_cov(obj, 0.0)
                 else:
                     val = self.ha.get_value(m.entity_id, m.mode, m.attr, analog=False)
-                    obj.presentValue = bool(val)  # type: ignore
+                    self._set_pv_no_cov(obj, bool(val))
 
             return await maybe_await(orig_read(*args, **kwargs))
         return dyn_read
@@ -556,6 +568,12 @@ class Server:
                 units = ENGINEERING_UNITS_ENUM.get(m.units)
                 if units is not None:
                     obj.units = units  # type: ignore
+            # COV defensiv initialisieren
+            try:
+                if hasattr(obj, "covIncrement") and getattr(obj, "covIncrement", None) is None:
+                    obj.covIncrement = 0.0  # type: ignore[attr-defined]
+            except Exception as e:
+                LOG.debug("covIncrement init skipped: %r", e)
         else:  # binaryValue
             obj = BV(objectIdentifier=key, objectName=name, presentValue=False)
 
@@ -653,13 +671,13 @@ class Server:
             if m.object_type == "analogValue":
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=True)
                 try:
-                    obj.presentValue = float(val or 0.0)  # type: ignore
+                    self._set_pv_no_cov(obj, float(val or 0.0))
                 except Exception:
-                    obj.presentValue = 0.0  # type: ignore
+                    self._set_pv_no_cov(obj, 0.0)
                 LOG.debug("Initial sync AV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
             else:
                 val = self.ha.get_value(ent_id, m.mode, m.attr, analog=False)
-                obj.presentValue = bool(val)  # type: ignore
+                self._set_pv_no_cov(obj, bool(val))
                 LOG.debug("Initial sync BV %s:%s -> %r", m.object_type, m.instance, obj.presentValue)
 
         LOG.debug("Mappings count: %d", len(self.mappings))
@@ -755,24 +773,19 @@ class Server:
             # --- GUARD setzen: diese Änderung stammt aus HA ---
             self._set_inbound_from_ha(obj, True)
             try:
-                # in BACnet-Objekt schreiben
+                # in BACnet-Objekt schreiben (ohne COV)
                 if m.object_type == "analogValue":
                     try:
                         if val in (None, "", "unknown", "unavailable"):
-                            obj.presentValue = 0.0  # type: ignore
+                            self._set_pv_no_cov(obj, 0.0)
                         else:
-                            obj.presentValue = float(val)  # type: ignore
+                            self._set_pv_no_cov(obj, float(val))
                     except Exception:
-                        obj.presentValue = 0.0  # type: ignore
+                        self._set_pv_no_cov(obj, 0.0)
                 else:  # binaryValue
-                    obj.presentValue = str(val).lower() in (
-                        "on",
-                        "true",
-                        "1",
-                        "open",
-                        "heat",
-                        "cool",
-                    )  # type: ignore
+                    self._set_pv_no_cov(obj, str(val).lower() in (
+                        "on", "true", "1", "open", "heat", "cool"
+                    ))
             finally:
                 # --- GUARD wieder entfernen ---
                 self._set_inbound_from_ha(obj, False)
