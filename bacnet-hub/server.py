@@ -38,7 +38,7 @@ def init_logging(default_level: str = "INFO") -> None:
 
     # Quiet down chatty libraries by default; raise if needed later
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    logging.getLogger("asyncio").setLevel(logging.warning)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
     # Route Python warnings to logging
     logging.captureWarnings(True)
