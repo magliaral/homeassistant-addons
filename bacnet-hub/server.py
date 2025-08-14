@@ -491,45 +491,45 @@ class Server:
     # ----------------------------
     # Wrapper-Fabriken für Read/Write (unterstützt CamelCase + snake_case)
     # ----------------------------
-def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
-    LOG.debug("Setup write wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
-
-    async def dyn_write(_self, *args, **kwargs):
-        LOG.debug(
-            "[WRITE] Incoming BACnet write request → %s:%s (%s) | args=%s kwargs=%s",
-            m.object_type, m.instance, m.entity_id, args, kwargs
-        )
-
-        # 1) Property-Identifier robust auslesen + normalisieren
-        prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
-        pid_raw = self._extract_prop_id(prop)
-        pid = self._norm_pid(pid_raw)
-        LOG.debug("[WRITE] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
-
-        # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
-        result = await maybe_await(orig_write(*args, **kwargs))
-        LOG.debug("[WRITE] Original BACnet write completed → result=%s", result)
-
-        # 3) Nachher: ggf. zu HA spiegeln
-        if self.ha and (pid in watched_properties):
-            if (not self._is_inbound_from_ha(obj)) and m.writable and m.write and m.write.get("service"):
-                pv_after = getattr(obj, "presentValue", None)
-                coerced = self._coerce_for_ha(m, pv_after)
-                LOG.info(
-                    "[WRITE] BACnet change detected → %s:%s (%s) | Property=%s | PV(after)=%s → Sync to HA",
-                    m.object_type, m.instance, m.entity_id, pid_raw, coerced
-                )
-                asyncio.create_task(self._write_to_ha(m, coerced))
-            else:
-                LOG.debug(
-                    "[WRITE] Change ignored (source=HA or not writable or no HA service configured)"
-                )
-        return result
-
-    return dyn_write
-
-def _make_read_wrapper(self, m: Mapping, obj, orig_read):
-    LOG.debug("Setup read wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
+    def _make_write_wrapper(self, m: Mapping, obj, orig_write, watched_properties: set):
+        LOG.debug("Setup write wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
+    
+        async def dyn_write(_self, *args, **kwargs):
+            LOG.debug(
+                "[WRITE] Incoming BACnet write request → %s:%s (%s) | args=%s kwargs=%s",
+                m.object_type, m.instance, m.entity_id, args, kwargs
+            )
+    
+            # 1) Property-Identifier robust auslesen + normalisieren
+            prop = args[0] if args else kwargs.get("prop") or kwargs.get("property") or None
+            pid_raw = self._extract_prop_id(prop)
+            pid = self._norm_pid(pid_raw)
+            LOG.debug("[WRITE] Property ID detected: raw=%s normalized=%s", pid_raw, pid)
+    
+            # 2) Originalen Write ausführen (BACnet-intern korrekt halten)
+            result = await maybe_await(orig_write(*args, **kwargs))
+            LOG.debug("[WRITE] Original BACnet write completed → result=%s", result)
+    
+            # 3) Nachher: ggf. zu HA spiegeln
+            if self.ha and (pid in watched_properties):
+                if (not self._is_inbound_from_ha(obj)) and m.writable and m.write and m.write.get("service"):
+                    pv_after = getattr(obj, "presentValue", None)
+                    coerced = self._coerce_for_ha(m, pv_after)
+                    LOG.info(
+                        "[WRITE] BACnet change detected → %s:%s (%s) | Property=%s | PV(after)=%s → Sync to HA",
+                        m.object_type, m.instance, m.entity_id, pid_raw, coerced
+                    )
+                    asyncio.create_task(self._write_to_ha(m, coerced))
+                else:
+                    LOG.debug(
+                        "[WRITE] Change ignored (source=HA or not writable or no HA service configured)"
+                    )
+            return result
+    
+        return dyn_write
+    
+    def _make_read_wrapper(self, m: Mapping, obj, orig_read):
+        LOG.debug("Setup read wrapper for %s:%s (%s)", m.object_type, m.instance, m.entity_id)
 
     async def dyn_read(_self, *args, **kwargs):
         LOG.debug(
